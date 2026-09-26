@@ -130,9 +130,11 @@ def run_audit(store: Any, client_id: str, website_id: str, max_pages: int = 6) -
     ``sitepulse_core`` check itself fails, the audit cannot produce its core
     data and :class:`AuditFailedError` is raised.
 
-    The audit ``status`` is ``"FAILED"`` when zero pages could be crawled
-    (never fake success), else ``"COMPLETE"``. The audit JSON is saved to
-    ``audits/<audit_id>.json`` via ``store.write_json`` and also returned.
+    The audit ``status`` is ``"BLOCKED"`` when zero pages could be crawled
+    (never fake success -- and never a fake score/grade), else ``"COMPLETE"``.
+    A BLOCKED audit keeps ``score``/``grade`` as ``None``. The audit JSON is
+    saved to ``audits/<audit_id>.json`` via ``store.write_json`` and also
+    returned.
     """
     website = get_website(store, client_id, website_id)
     require_authorized(website)  # raises NotAuthorizedError when not authorized
@@ -180,7 +182,9 @@ def run_audit(store: Any, client_id: str, website_id: str, max_pages: int = 6) -
 
     site = ctx["site"] or {}
     pages_crawled = int(site.get("pages_crawled", 0))
-    status = "FAILED" if pages_crawled == 0 else "COMPLETE"
+    # FIX 4: zero pages crawled means BLOCKED, never FAILED-with-0/F.
+    # Score and grade stay None — there is nothing to grade.
+    status = site.get("status") or ("BLOCKED" if pages_crawled == 0 else "COMPLETE")
     counts = site.get("counts", {"critical": 0, "warning": 0, "info": 0})
     notes = list(site.get("notes", [])) + notes
 
@@ -193,8 +197,8 @@ def run_audit(store: Any, client_id: str, website_id: str, max_pages: int = 6) -
         "started_at": started_at,
         "status": status,
         "engine": ENGINE_NAME,
-        "score": site.get("score", 0),
-        "grade": site.get("grade", "F"),
+        "score": site.get("score"),
+        "grade": site.get("grade"),
         "pages_crawled": pages_crawled,
         "counts": counts,
         "findings": all_findings,

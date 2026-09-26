@@ -12,7 +12,10 @@ import uuid
 from typing import Any
 
 SEVERITIES: list[str] = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "PASS"]
-CONFIDENCES: list[str] = ["CONFIRMED", "LIKELY", "NEEDS MANUAL REVIEW"]
+# FIX 7: NEEDS_RENDERED_REVIEW — the raw-HTML evidence contradicts what a
+# browser renders (e.g. img-alt counts inflated by hidden/duplicate markup);
+# a real rendered-DOM check is required before the finding can be asserted.
+CONFIDENCES: list[str] = ["CONFIRMED", "LIKELY", "NEEDS MANUAL REVIEW", "NEEDS_RENDERED_REVIEW"]
 FINDING_STATES: list[str] = [
     "FOUND",
     "RECOMMENDED",
@@ -117,14 +120,29 @@ def from_engine_finding(
     """
     check = raw.get("check", "")
     page = raw.get("page", "")
+    # FIX 6/7: engine review hints override the check-table confidence.
+    # review_hint=True  -> page looked JS-rendered, static HTML said nothing
+    # review_hint="rendered" -> raw HTML contradicts rendered reality
+    #   (e.g. img-alt counts); a browser check is required before asserting.
+    review_hint = raw.get("review_hint")
+    confidence = CONFIDENCE_BY_CHECK.get(check, DEFAULT_CONFIDENCE)
+    if review_hint == "rendered":
+        confidence = "NEEDS_RENDERED_REVIEW"
+    elif review_hint:
+        confidence = "NEEDS MANUAL REVIEW"
     return {
         "id": _new_finding_id(),
         "check": check,
         "page": page,
+        # FIX 5: every finding says which page (and what kind) it came from.
+        "page_kind": raw.get("page_kind", "content"),
+        # FIX 6: how this finding was verified — never claim browser evidence
+        # from an HTTP fetch.
+        "verification": raw.get("verification", "HTTP_FETCH"),
         "issue": raw.get("title", ""),
         "evidence": raw.get("evidence", ""),
         "severity": SEVERITY_MAP.get(raw.get("severity", ""), "LOW"),
-        "confidence": CONFIDENCE_BY_CHECK.get(check, DEFAULT_CONFIDENCE),
+        "confidence": confidence,
         "why_it_matters": raw.get("why_it_matters", ""),
         "recommended_fix": raw.get("recommended_fix", ""),
         "implementation_path": "",

@@ -191,6 +191,39 @@ cross-channel checks, service catalog + evidence-gated opportunity map +
 one→many expansion, re-audit loop with history preservation, Gmail dry-run
 delivery + delivery log, 7 email templates, full CLI, 45-test suite.
 
+### Auditor: verified vs limitations (read before quoting results)
+
+**VERIFIED (what the auditor actually does):**
+
+- Plain **HTTP fetching** with a browser-like user agent, up to 10 redirects
+  followed, connection errors retried once.
+- Raw-HTML parsing of metadata, headings, images, links, forms, and
+  noindex/canonical directives — all labeled `verification: HTTP_FETCH`.
+- Utility-page awareness: `cart`, `checkout`, `login`, `account`, etc. are
+  classified `page_kind: utility`; expected utility behavior (e.g. cart
+  `noindex`) is never scored as a failure, and utility findings are excluded
+  from the site score.
+- Unreachable sites return `status: BLOCKED` with **no score and no grade**.
+- Image-alt counts exclude non-rendered images (hidden containers,
+  `<noscript>`/`<template>`, tracking pixels, data URIs) and duplicates by
+  resolved `src`. When raw HTML strongly suggests missing alts on a
+  content-rich page but the rendered page may differ, the finding is marked
+  `NEEDS_RENDERED_REVIEW` (warning) instead of asserting a count.
+
+**LIMITATIONS (what it does not do):**
+
+- The auditor **cannot see what a browser sees**. Findings come from static
+  HTML only — no JavaScript executes, no CSS applies, nothing renders.
+- Near-empty static shells (JS-rendered pages) are flagged
+  `NEEDS MANUAL REVIEW` rather than reported as ordinary failures.
+- `NEEDS_RENDERED_REVIEW` findings require a real rendered-DOM check before
+  they can be quoted as fact.
+
+**PLANNED (not implemented):** an actual Chromium/browser-rendered audit
+mode that would verify `NEEDS_RENDERED_REVIEW` findings against the real
+rendered DOM. Until it exists, **never claim browser verification** — not
+from curl, not from `requests`, not from fetched page source.
+
 **EXPERIMENTAL:** footprint/social discovery (public homepage links only; no
 search API, so Google Business/directories report NOT FOUND honestly; major
 social platforms usually bot-block fetches → honest ERROR findings).

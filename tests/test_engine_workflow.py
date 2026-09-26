@@ -271,18 +271,20 @@ def test_14_duplicate_audits_no_duplicate_clients(
 
 
 def test_15_failed_audit_blocked(store, acme_client, acme_site, monkeypatch):
-    """A15: a 0-page crawl yields status FAILED and report generation
-    raises ReportError.
+    """A15: a 0-page crawl yields status BLOCKED (with no score and no
+    grade) and report generation raises ReportError.
 
     Simulated by monkeypatching the vendored engine's ``audit_site`` to
-    return pages_crawled=0 (the registry must never fake success).
+    return pages_crawled=0 (the registry must never fake success -- and
+    never a fake score/grade either).
     """
     def fake_audit_site(url: str, max_pages: int = 6) -> dict:
         return {
             "url": url,
+            "status": "BLOCKED",
             "pages_crawled": 0,
-            "score": 0,
-            "grade": "F",
+            "score": None,
+            "grade": None,
             "counts": {"critical": 0, "warning": 0, "info": 0},
             "findings": [],
             "elapsed_total": 0.0,
@@ -295,6 +297,8 @@ def test_15_failed_audit_blocked(store, acme_client, acme_site, monkeypatch):
     audit = audit_registry.run_audit(
         store, acme_client["id"], acme_site["id"], max_pages=2
     )
-    assert audit["status"] == "FAILED"
+    assert audit["status"] == "BLOCKED"
+    assert audit["score"] is None
+    assert audit["grade"] is None
     with pytest.raises(ReportError):
         reports.generate_audit_report(store, acme_client["id"], audit["id"])

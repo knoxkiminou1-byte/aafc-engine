@@ -1,7 +1,7 @@
 """Audit and verification reports for the AAFC business engine.
 
 generate_audit_report renders a Markdown report from a COMPLETE audit and
-persists both the Markdown and a JSON record. A FAILED audit can never
+persists both the Markdown and a JSON record. A BLOCKED audit can never
 produce a success report: ReportError is raised instead.
 
 generate_verification_report compares two COMPLETE audits via reaudit.compare
@@ -23,7 +23,7 @@ EM_DASH = "\u2014"
 
 
 class ReportError(Exception):
-    """Raised when a report cannot be generated (e.g. a FAILED audit)."""
+    """Raised when a report cannot be generated (e.g. a BLOCKED audit)."""
 
 
 REPORT_DIRNAME = "reports"
@@ -33,6 +33,13 @@ SEVERITY_ORDER = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "PASS"]
 def _now() -> str:
     """Current UTC timestamp in ISO-8601 format."""
     return datetime.now(timezone.utc).isoformat()
+
+
+def _score_display(audit: dict[str, Any]) -> str:
+    """Human-readable score line. BLOCKED audits have no score or grade."""
+    if audit.get("status") == "BLOCKED" or audit.get("score") is None:
+        return "BLOCKED — no score (site could not be loaded)"
+    return f"**{audit.get('score')}** (grade **{audit.get('grade')}**)"
 
 
 def _domain_for(
@@ -99,7 +106,7 @@ def _render_audit_markdown(
 
     lines.append("## Score")
     lines.append("")
-    lines.append(f"Overall score: **{audit.get('score')}** (grade **{audit.get('grade')}**)")
+    lines.append(f"Overall score: {_score_display(audit)}")
     lines.append("")
     lines.append(f"Pages crawled: {audit.get('pages_crawled')}")
     lines.append(f"Findings: {total} total {EM_DASH} {count_line}.")
@@ -239,7 +246,7 @@ def generate_audit_report(
     """Generate a Markdown + JSON audit report for a COMPLETE audit.
 
     Raises ReportError when the audit does not exist or its status is not
-    COMPLETE: a FAILED audit must never produce a success report. Findings
+    COMPLETE: a BLOCKED audit must never produce a success report. Findings
     are grouped CRITICAL -> HIGH -> MEDIUM -> LOW -> PASS.
 
     Saves reports/<report_id>.md (or <out_dir>/<report_id>.md when out_dir is
@@ -299,7 +306,7 @@ def _render_verification_markdown(
     lines.append("")
     lines.append(f"Audit ID: `{old_audit.get('id')}`")
     lines.append(
-        f"Score: **{old_audit.get('score')}** (grade **{old_audit.get('grade')}**) "
+        f"Score: {_score_display(old_audit)} "
         f"across {old_audit.get('pages_crawled')} page(s), "
         f"{len(old_audit.get('findings', []))} finding(s) recorded."
     )
@@ -309,7 +316,7 @@ def _render_verification_markdown(
     lines.append("")
     lines.append(f"Audit ID: `{new_audit.get('id')}`")
     lines.append(
-        f"Score: **{new_audit.get('score')}** (grade **{new_audit.get('grade')}**) "
+        f"Score: {_score_display(new_audit)} "
         f"across {new_audit.get('pages_crawled')} page(s), "
         f"{len(new_audit.get('findings', []))} finding(s) recorded."
     )
