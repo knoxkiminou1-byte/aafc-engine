@@ -1,0 +1,9 @@
+Hi {{customer_name}},
+
+The planned fixes for {{website}} are complete — {{findings_count}} item(s)
+implemented for {{business_name}}.
+
+Next step: {{next_step}} (we recommend a re-audit to verify every fix with
+fresh evidence before we call the project done).
+
+— The AAFC Team

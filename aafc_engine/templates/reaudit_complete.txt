@@ -1,0 +1,11 @@
+Hi {{customer_name}},
+
+We've re-audited {{website}} for {{business_name}}.
+
+New score: {{score}} (grade {{grade}}). {{findings_count}} issue(s) remain
+open — everything else from the original audit verified as resolved with
+fresh evidence.
+
+Next step: {{next_step}}
+
+— The AAFC Team

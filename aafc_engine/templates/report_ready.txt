@@ -1,0 +1,13 @@
+Hi {{customer_name}},
+
+Your website audit report for {{business_name}} is ready:
+
+{{report_link}}
+
+Headline numbers: score {{score}}, grade {{grade}}. The report groups every
+finding by severity, explains why each one matters, and lists concrete fixes
+with a verification step for each.
+
+Next step: {{next_step}}
+
+— The AAFC Team

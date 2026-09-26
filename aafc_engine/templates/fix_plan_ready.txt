@@ -1,0 +1,11 @@
+Hi {{customer_name}},
+
+We've turned the audit of {{website}} into a fix plan for {{business_name}}.
+
+It covers {{findings_count}} issue(s), sequenced so the highest-impact fixes
+come first. Each item has a concrete implementation path and a verification
+method, so you'll know exactly when each fix is truly done.
+
+Next step: {{next_step}}
+
+— The AAFC Team

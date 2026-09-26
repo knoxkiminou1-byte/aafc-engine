@@ -1,0 +1,10 @@
+Hi {{customer_name}},
+
+Your project proposal for {{business_name}} is ready: {{project_name}}.
+
+It lays out scope, timeline, and pricing based on the audit findings, so you
+can approve the work with full confidence in what you're getting.
+
+Next step: {{next_step}}
+
+— The AAFC Team

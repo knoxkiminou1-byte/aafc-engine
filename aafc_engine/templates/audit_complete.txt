@@ -1,0 +1,13 @@
+Hi {{customer_name}},
+
+The website audit for {{business_name}} ({{website}}) is complete.
+
+Your site scored {{score}} (grade {{grade}}). We found {{findings_count}}
+issue(s) worth your attention, ranked by severity, each with concrete
+evidence, why it matters, and a recommended fix.
+
+Next step: {{next_step}}
+
+Reply to this email if you'd like a walkthrough of the results.
+
+— The AAFC Team

@@ -1,0 +1,14 @@
+Hi {{customer_name}},
+
+Thanks for asking AAFC to audit {{business_name}}'s website ({{website}}).
+
+We've queued your audit for {{audit_date}}. We'll review performance, SEO
+basics, accessibility, and common technical issues, then send you a clear
+report of what we found — ranked by severity, with evidence and recommended
+fixes for each item.
+
+Next step: {{next_step}}
+
+Reply to this email any time if you have questions.
+
+— The AAFC Team
