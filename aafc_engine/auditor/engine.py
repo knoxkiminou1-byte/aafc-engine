@@ -23,7 +23,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from html.parser import HTMLParser
-from urllib.parse import urljoin, urlparse, urldefrag
+from urllib.parse import urljoin, urlparse, urldefrag, urlunparse
 
 import requests
 
@@ -272,6 +272,15 @@ def same_host(a, b):
     return urlparse(a).netloc.lower() == urlparse(b).netloc.lower()
 
 
+def norm_url(u):
+    """Canonicalize a URL for crawl dedup: lowercase scheme/host, strip
+    trailing slash, drop fragments. Without this, 'https://x.com' and
+    'https://x.com/' crawl as two different pages and double every finding."""
+    p = urlparse(u.strip())
+    path = p.path.rstrip("/")  # "" and "/" become the same page
+    return urlunparse((p.scheme.lower(), p.netloc.lower(), path, "", p.query, ""))
+
+
 def clean_link(href, base):
     if not href:
         return None
@@ -282,7 +291,7 @@ def clean_link(href, base):
     absu, _ = urldefrag(absu)
     if urlparse(absu).scheme not in ("http", "https"):
         return None
-    return absu
+    return norm_url(absu)
 
 
 # ----------------------------------------------------------------------------
@@ -666,8 +675,14 @@ def check_robots_and_sitemap(base_url):
             technical=f"robots_status={r['status']}"))
     sm_url = urljoin(base_url, "/sitemap.xml")
     s = fetch(sm_url)
-    if s["ok"] and s["status"] == 200 and "<url" in s["text"][:2000]:
+    # FIX 9: accept sitemap INDEX files too (<sitemapindex>, used by
+    # WordPress/Yoast), not just <urlset> files — and the fetcher follows
+    # redirects, so /sitemap.xml -> /wp-sitemap.xml counts as found.
+    head = s["text"][:2000].lower()
+    if s["ok"] and s["status"] == 200 and ("<url" in head or "sitemapindex" in head):
         info["sitemap_xml"] = True
+        if s.get("final_url") and s["final_url"] != sm_url:
+            info["sitemap_final_url"] = s["final_url"]
     else:
         info["sitemap_xml"] = False
         findings.append(F(base_url, "sitemap", "warning", "No XML sitemap found",
@@ -719,6 +734,7 @@ def audit_site(start_url, max_pages=6):
     started_all = time.time()
     if not urlparse(start_url).scheme:
         start_url = "https://" + start_url
+    start_url = norm_url(start_url)
     findings, page_stats = [], []
     seen, queue = set(), [start_url]
     crawled = 0
@@ -776,8 +792,15 @@ def audit_site(start_url, max_pages=6):
     # are reported for completeness but never affect the score — grading a
     # cart page's noindex like a landing-page failure is how franklinbarbecue
     # got an F it didn't deserve. The score reflects content pages only.
-    scored = [f for f in findings if f.get("page_kind") != "utility"]
-    excluded_utility = len(findings) - len(scored)
+    # FIX 8 (honesty): findings the engine flagged review_hint on are ones it
+    # explicitly cannot verify from raw HTML ("needs rendered-DOM check").
+    # Penalizing the score for a check we admit we couldn't run is a false
+    # alarm with a number attached — reported, never scored.
+    scored = [f for f in findings
+              if f.get("page_kind") != "utility" and not f.get("review_hint")]
+    excluded_utility = sum(1 for f in findings if f.get("page_kind") == "utility")
+    excluded_unverifiable = sum(1 for f in findings
+                                if f.get("page_kind") != "utility" and f.get("review_hint"))
     crit = sum(1 for f in scored if f["severity"] == "critical")
     warn = sum(1 for f in scored if f["severity"] == "warning")
     score = max(0, 100 - 12 * crit - 5 * warn)
@@ -812,6 +835,7 @@ def audit_site(start_url, max_pages=6):
             "warning": warn,
             "info": sum(1 for f in scored if f["severity"] == "info"),
             "utility_page_findings_excluded_from_score": excluded_utility,
+            "unverifiable_findings_excluded_from_score": excluded_unverifiable,
         },
         "robots": rinfo,
         "pages": page_stats,
@@ -821,6 +845,7 @@ def audit_site(start_url, max_pages=6):
             "Speed measurements are server-to-server fetches, not real browser timings.",
             "Broken-link check covers up to 25 same-host links on the homepage only.",
             "Findings from utility pages (cart, checkout, login, ...) are reported but excluded from the score.",
+            "Findings the engine could not verify from raw HTML are reported as needing review, not scored.",
             "Checks are heuristic; a human review should confirm critical findings before client delivery.",
         ],
     }
