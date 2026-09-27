@@ -22,6 +22,7 @@ import re
 import sys
 import threading
 import time
+from collections import Counter
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from html.parser import HTMLParser
@@ -907,6 +908,7 @@ def check_broken_links(url, parser, cap=25, rendered_links=None, time_left=None)
         if len(targets) >= cap:
             break
     broken = []
+    refused_links = []  # (url, status): bot protection answered, not broken
     checked = 0
     for t in targets:
         if time_left is not None and time_left() is not None and time_left() <= 0:
@@ -925,9 +927,22 @@ def check_broken_links(url, parser, cap=25, rendered_links=None, time_left=None)
         if not r["ok"] or (r["status"] and r["status"] >= 400):
             # HEAD sometimes rejected; confirm with GET before calling it broken
             r2 = fetch(t, method="GET", timeout=link_timeout, allow_retry=link_retry)
-            if not r2["ok"] or (r2["status"] and r2["status"] >= 400):
-                broken.append((t, r2["status"] or r2["error"]))
+            st = r2["status"]
+            if st in (401, 403, 429):
+                # FIX 9 (continued): a WAF / rate limiter answering is not a
+                # broken link — it's a refused check. Report it, don't ding it.
+                refused_links.append((t, st))
+            elif not r2["ok"] or (st and st >= 400):
+                broken.append((t, st or r2["error"]))
     findings = []
+    if refused_links:
+        examples = "; ".join(f"{u} ({s})" for u, s in refused_links[:5])
+        findings.append(F(url, "bot_protection", "info",
+            f"{len(refused_links)} link(s) refused automated checks — not counted as broken",
+            f"The site's bot protection / rate limiter answered instead of the page. Examples: {examples}",
+            "Refused checks can't verify the link target; they say nothing about whether the link works for real visitors.",
+            "If this is your site and the links matter, allowlist well-behaved crawlers or re-check these URLs in a browser.",
+            technical=f"link_refused={len(refused_links)}/{checked}"))
     if broken:
         sev = "critical" if len(broken) >= 3 else "warning"
         examples = "; ".join(f"{u} ({s})" for u, s in broken[:5])
@@ -990,12 +1005,15 @@ def audit_site(start_url, max_pages=6, render=True, time_budget=None):
     findings, page_stats = [], []
     seen, queue = set(), [start_url]
     crawled_pages = []  # (url, res, parser) in crawl order; checked after render
+    refused: list = []  # (url, status) pages the site's bot protection walled
+    attempts = 0  # every fetch attempt counts toward max_pages, not just 200s
 
-    while queue and len(crawled_pages) < max_pages and not _budget_hit():
+    while queue and attempts < max_pages and not _budget_hit():
         url = queue.pop(0)
         if url in seen:
             continue
         seen.add(url)
+        attempts += 1
         res = fetch(url, timeout=_fetch_timeout(), allow_retry=_retry_ok())
         if not res["ok"]:
             findings.append(F(url, "fetch", "critical", "Page could not be loaded",
@@ -1003,6 +1021,14 @@ def audit_site(start_url, max_pages=6, render=True, time_budget=None):
                 "If an automated check can't load the page, some visitors and search engines can't either — every one of those visits is lost.",
                 "Check that the site loads reliably: hosting status, DNS settings, and server errors.",
                 technical=f"GET {url} failed: {res['error']}"))
+            continue
+        if res["status"] and res["status"] in (401, 403, 429):
+            # FIX 9 (honesty): the site's bot protection / rate limiter
+            # answered instead of the page. That is a measurement limit, not
+            # a site defect — collapse to one finding, never N criticals
+            # (lowes.com once produced sixteen "Page returns HTTP 403"
+            # criticals and a 0/F for a site that loads fine for humans).
+            refused.append((url, res["status"]))
             continue
         if res["status"] and res["status"] >= 400:
             findings.append(F(url, "http_status", "critical",
@@ -1037,6 +1063,24 @@ def audit_site(start_url, max_pages=6, render=True, time_budget=None):
 
     crawled = len(crawled_pages)
     budget_exceeded = _budget_hit()
+
+    if refused:
+        # FIX 9 (continued): one honest finding for all bot-walled pages.
+        # Warning, not critical, and excluded from the score — we could not
+        # measure these pages, so penalizing the site for them would be a
+        # false alarm with a number attached.
+        codes = Counter(s for _, s in refused)
+        detail = ", ".join(f"{n}x HTTP {c}" for c, n in sorted(codes.items()))
+        examples = "; ".join(u for u, _ in refused[:3])
+        findings.append(F(start_url, "bot_protection", "warning",
+            f"{len(refused)} page(s) refused automated checks",
+            f"The site's bot protection answered instead of the page ({detail}). "
+            f"Examples: {examples}",
+            "When a site blocks automated checks, we cannot verify those pages — "
+            "and some visitors, scrapers, and search tools may hit the same wall.",
+            "If this is your site, check the firewall/CDN bot rules (allowlist "
+            "well-behaved audit crawlers) and re-run the audit for the full check.",
+            technical=f"refused={len(refused)}; {detail}"))
 
     # -- rendered-DOM pass -------------------------------------------------
     # One shared headless Chromium for every crawled page. Rendered evidence
@@ -1109,10 +1153,14 @@ def audit_site(start_url, max_pages=6, render=True, time_budget=None):
     # Penalizing the score for a check we admit we couldn't run is a false
     # alarm with a number attached — reported, never scored.
     scored = [f for f in findings
-              if f.get("page_kind") != "utility" and not f.get("review_hint")]
+              if f.get("page_kind") != "utility" and not f.get("review_hint")
+              and f.get("check") != "bot_protection"]
     excluded_utility = sum(1 for f in findings if f.get("page_kind") == "utility")
     excluded_unverifiable = sum(1 for f in findings
                                 if f.get("page_kind") != "utility" and f.get("review_hint"))
+    excluded_bot_blocked = sum(1 for f in findings
+                               if f.get("check") == "bot_protection"
+                               and f.get("severity") in ("warning", "critical"))
     crit = sum(1 for f in scored if f["severity"] == "critical")
     warn = sum(1 for f in scored if f["severity"] == "warning")
     score = max(0, 100 - 12 * crit - 5 * warn)
@@ -1130,8 +1178,9 @@ def audit_site(start_url, max_pages=6, render=True, time_budget=None):
             "Nothing here was graded: the score below is absent, not zero. A site that doesn't load can't rank or convert — this is the first thing to fix.",
             "Restore reliable site loading, then re-run the audit for the full check.",
             technical="pages_crawled=0; no HTTP 200 page fetched"))
-    elif budget_exceeded:
-        # Honest partial: the budget ran out before the audit finished.
+    elif budget_exceeded or refused:
+        # Honest partial: the budget ran out before the audit finished, or
+        # the site's bot protection walled off pages we set out to check.
         # The score below covers only the pages fully checked; the grade is
         # withheld because presenting one would be a fake full grade.
         status = "PARTIAL"
@@ -1154,6 +1203,7 @@ def audit_site(start_url, max_pages=6, render=True, time_budget=None):
             "info": sum(1 for f in scored if f["severity"] == "info"),
             "utility_page_findings_excluded_from_score": excluded_utility,
             "unverifiable_findings_excluded_from_score": excluded_unverifiable,
+            "bot_blocked_findings_excluded_from_score": excluded_bot_blocked,
         },
         # RENDER: how this audit verified its DOM-sensitive findings.
         # mode is one of: "rendered" (headless Chromium ran and its DOM
@@ -1178,6 +1228,7 @@ def audit_site(start_url, max_pages=6, render=True, time_budget=None):
             "Speed measurements are server-to-server fetches, not real browser timings.",
             "Broken-link check covers up to 25 same-host links on the homepage only.",
             "Findings from utility pages (cart, checkout, login, ...) are reported but excluded from the score.",
+            "Pages/links the site's bot protection refused to serve are reported as unmeasurable, not as defects, and excluded from the score.",
             "Findings the engine could not verify from raw HTML are reported as needing review, not scored.",
         ] + ([
             "Rendered-DOM verification ON: the engine's own headless Chromium rendered every crawled page and the rendered DOM outranked the raw HTML."
@@ -1214,7 +1265,7 @@ def render_client_report(site):
         if site.get("status") == "PARTIAL":
             L.append(f"## Overall score so far: {site['score']}/100 (partial audit — grade withheld)")
             L.append("")
-            L.append("_This audit hit its time budget before finishing, so the score covers only the pages that were fully checked. Run the full audit for a final grade._")
+            L.append("_This audit couldn't check everything it set out to — the time budget ran out or some pages refused automated checks — so the score covers only the pages that were fully checked. Run the full audit for a final grade._")
             L.append("")
         else:
             L.append(f"## Overall score: {site['score']}/100 (Grade {site['grade']})")
