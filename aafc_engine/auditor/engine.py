@@ -280,15 +280,20 @@ def _guard_response_hook(response, *args, **kwargs):
             FETCH_GUARD(urljoin(response.url, location))  # raises ValueError
 
 
-def fetch(url, method="GET", _retried=False):
+def fetch(url, method="GET", _retried=False, timeout=None, allow_retry=True):
     """Fetch a URL. Returns dict with status, final_url, headers, text, elapsed, error.
 
     Follows redirect chains (requests handles this; we record the chain) and
     retries once on transient connection errors. A browser-like UA is used
     because unknown bot UAs are blocked outright by some sites/WAFs, which
     used to surface as false "site did not respond" failures.
+
+    ``timeout``: per-request socket timeout in seconds (default TIMEOUT).
+    ``allow_retry``: when False, no retry is attempted (used when the audit
+    time budget is nearly spent — a retry must never blow the budget).
     """
     started = time.time()
+    req_timeout = TIMEOUT if timeout is None else timeout
     session = requests.Session()
     session.max_redirects = MAX_REDIRECTS
     if FETCH_GUARD is not None:
@@ -303,7 +308,7 @@ def fetch(url, method="GET", _retried=False):
             }
         session.hooks["response"].append(_guard_response_hook)
     try:
-        r = session.request(method, url, headers=UA, timeout=TIMEOUT,
+        r = session.request(method, url, headers=UA, timeout=req_timeout,
                             allow_redirects=True)
         elapsed = time.time() - started
         text = r.text if method == "GET" else ""
@@ -324,11 +329,12 @@ def fetch(url, method="GET", _retried=False):
             "error": f"Blocked: {e}",
         }
     except requests.RequestException as e:
-        if not _retried and isinstance(
+        if allow_retry and not _retried and isinstance(
             e, (requests.ConnectionError, requests.Timeout)
         ):
             time.sleep(1)
-            return fetch(url, method=method, _retried=True)
+            return fetch(url, method=method, _retried=True,
+                         timeout=timeout, allow_retry=allow_retry)
         return {
             "ok": False, "status": None, "final_url": url, "headers": {},
             "text": "", "bytes": 0, "elapsed": round(time.time() - started, 2),
@@ -841,11 +847,11 @@ def check_page(url, res, parser, rendered=None):
 # ----------------------------------------------------------------------------
 # Site-level checks
 # ----------------------------------------------------------------------------
-def check_robots_and_sitemap(base_url):
+def check_robots_and_sitemap(base_url, timeout=None, allow_retry=True):
     findings = []
     info = {}
     robots_url = urljoin(base_url, "/robots.txt")
-    r = fetch(robots_url)
+    r = fetch(robots_url, timeout=timeout, allow_retry=allow_retry)
     if r["ok"] and r["status"] == 200 and r["text"].strip():
         info["robots_txt"] = True
         sitemaps = re.findall(r"(?im)^sitemap:\s*(\S+)", r["text"])
@@ -858,7 +864,7 @@ def check_robots_and_sitemap(base_url):
             "Add a simple robots.txt (allow crawling + Sitemap: line).",
             technical=f"robots_status={r['status']}"))
     sm_url = urljoin(base_url, "/sitemap.xml")
-    s = fetch(sm_url)
+    s = fetch(sm_url, timeout=timeout, allow_retry=allow_retry)
     # FIX 9: accept sitemap INDEX files too (<sitemapindex>, used by
     # WordPress/Yoast), not just <urlset> files — and the fetcher follows
     # redirects, so /sitemap.xml -> /wp-sitemap.xml counts as found.
@@ -905,11 +911,20 @@ def check_broken_links(url, parser, cap=25, rendered_links=None, time_left=None)
     for t in targets:
         if time_left is not None and time_left() is not None and time_left() <= 0:
             break
-        r = fetch(t, method="HEAD")
+        # Bound every link fetch by the remaining budget: a single stalled
+        # host must never blow the audit's time budget (serverless functions
+        # get killed past their limit, which used to surface as a 504).
+        tl = time_left() if time_left is not None else None
+        if tl is None:
+            link_timeout, link_retry = TIMEOUT, True
+        else:
+            link_timeout = min(TIMEOUT, max(2.0, tl - 5.0))
+            link_retry = tl > TIMEOUT + 2
+        r = fetch(t, method="HEAD", timeout=link_timeout, allow_retry=link_retry)
         checked += 1
         if not r["ok"] or (r["status"] and r["status"] >= 400):
             # HEAD sometimes rejected; confirm with GET before calling it broken
-            r2 = fetch(t, method="GET")
+            r2 = fetch(t, method="GET", timeout=link_timeout, allow_retry=link_retry)
             if not r2["ok"] or (r2["status"] and r2["status"] >= 400):
                 broken.append((t, r2["status"] or r2["error"]))
     findings = []
@@ -952,6 +967,23 @@ def audit_site(start_url, max_pages=6, render=True, time_budget=None):
     def _budget_hit():
         left = _budget_left()
         return left is not None and left <= 0
+
+    def _fetch_timeout():
+        """Per-request timeout bound by the remaining budget.
+
+        Reserves ~5s for the check/report phase so the total can never run
+        past the budget into a serverless-function kill (which used to
+        surface as a bare 504 instead of an honest PARTIAL result).
+        """
+        left = _budget_left()
+        if left is None:
+            return TIMEOUT
+        return min(TIMEOUT, max(2.0, left - 5.0))
+
+    def _retry_ok():
+        left = _budget_left()
+        return left is None or left > TIMEOUT + 2
+
     if not urlparse(start_url).scheme:
         start_url = "https://" + start_url
     start_url = norm_url(start_url)
@@ -964,7 +996,7 @@ def audit_site(start_url, max_pages=6, render=True, time_budget=None):
         if url in seen:
             continue
         seen.add(url)
-        res = fetch(url)
+        res = fetch(url, timeout=_fetch_timeout(), allow_retry=_retry_ok())
         if not res["ok"]:
             findings.append(F(url, "fetch", "critical", "Page could not be loaded",
                 "The site did not respond when we tried to visit it (connection failed or timed out).",
@@ -1063,7 +1095,8 @@ def audit_site(start_url, max_pages=6, render=True, time_budget=None):
             "Re-run the full audit from the CLI (aafc audit run) for the complete result.",
             technical=f"time_budget={time_budget}s; pages_checked={len(page_stats)}/{crawled}"))
 
-    rf, rinfo = check_robots_and_sitemap(start_url)
+    rf, rinfo = ([], {}) if _budget_hit() else check_robots_and_sitemap(
+        start_url, timeout=_fetch_timeout(), allow_retry=_retry_ok())
     findings.extend(rf)
 
     # -- score ------------------------------------------------------------

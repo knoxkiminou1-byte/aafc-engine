@@ -162,7 +162,7 @@ def test_utility_findings_excluded_from_score(monkeypatch):
                  '<meta name="robots" content="noindex"></head>'
                  '<body><h1>Cart</h1></body></html>')
 
-    def fake_fetch(url, method="GET", _retried=False):
+    def fake_fetch(url, method="GET", _retried=False, **kwargs):
         html = cart_html if "cart" in url else home_html
         return make_res(url, html)
 
@@ -179,7 +179,7 @@ def test_utility_findings_excluded_from_score(monkeypatch):
 # FIX 4: BLOCKED with no score and no grade
 # ---------------------------------------------------------------------------
 def test_unreachable_site_is_blocked_without_score_or_grade(monkeypatch):
-    def fake_fetch(url, method="GET", _retried=False):
+    def fake_fetch(url, method="GET", _retried=False, **kwargs):
         return {"ok": False, "status": None, "final_url": url, "headers": {},
                 "text": "", "bytes": 0, "elapsed": 0.5,
                 "redirects": 0, "redirect_chain": [],

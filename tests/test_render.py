@@ -180,7 +180,7 @@ def test_audit_site_reports_render_mode(monkeypatch, tmp_path):
     try:
         monkeypatch.setattr(
             "aafc_engine.auditor.engine.check_robots_and_sitemap",
-            lambda base: ([], {"robots": False, "sitemap": None}),
+            lambda base, **kw: ([], {"robots": False, "sitemap": None}),
         )
         site = audit_site(f"http://127.0.0.1:{port}/index.html",
                           max_pages=1, render=True)
@@ -237,7 +237,7 @@ def test_audit_site_render_requested_but_no_renderer(monkeypatch, tmp_path):
     try:
         monkeypatch.setattr(
             "aafc_engine.auditor.engine.check_robots_and_sitemap",
-            lambda base: ([], {"robots": False, "sitemap": None}),
+            lambda base, **kw: ([], {"robots": False, "sitemap": None}),
         )
         monkeypatch.setattr(render_provider, "_available", None)
         import sys
