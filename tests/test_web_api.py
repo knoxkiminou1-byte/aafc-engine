@@ -20,6 +20,7 @@ from __future__ import annotations
 import functools
 import http.server
 import threading
+import time
 
 import pytest
 
@@ -221,3 +222,52 @@ def test_quick_audit_limits_are_server_side(fixture_site, allow_loopback):
     assert result["limits"]["max_pages"] == QUICK_MAX_PAGES
     assert result["limits"]["time_budget_seconds"] == QUICK_TIME_BUDGET
     assert result["pages_crawled"] <= QUICK_MAX_PAGES
+
+
+# ---------------------------------------------------------------------------
+# Hardening: wedged DNS / tarpitted targets must yield PARTIAL, never a 504
+# ---------------------------------------------------------------------------
+def test_dns_hang_fails_closed_fast(monkeypatch):
+    """socket.getaddrinfo has no timeout of its own: a wedged resolver must
+    not hang the guard. Found live: pizzahut.com 504'd the function."""
+    import api.index as api_mod
+    import threading
+
+    def _hang(host, port, *a, **k):
+        threading.Event().wait(120)  # never answers
+        raise OSError("unreachable")
+
+    monkeypatch.setattr(api_mod.socket, "getaddrinfo", _hang)
+    t0 = time.time()
+    assert api_mod._host_is_public("wedged-resolver-12345.test") is False
+    assert time.time() - t0 < api_mod._DNS_TIMEOUT + 5
+
+
+def test_wedged_audit_returns_partial_not_hang(monkeypatch):
+    """If the engine itself wedges (tarpitted socket defeating per-request
+    timeouts), the hard cap still returns an honest PARTIAL quickly."""
+    import time as time_mod
+    import api.index as api_mod
+    from aafc_engine.auditor import engine as eng
+
+    def _wedged(*a, **k):
+        time_mod.sleep(120)
+
+    monkeypatch.setattr(eng, "audit_site", _wedged)
+    monkeypatch.setattr(api_mod, "QUICK_HARD_CAP", 3.0)
+    t0 = time_mod.time()
+    result = run_quick_audit("https://example.com/")
+    dt = time_mod.time() - t0
+    assert dt < 10, f"hard cap not enforced: {dt:.1f}s"
+    assert result["status"] == "PARTIAL"
+    assert result["score"] is None
+    assert result["grade"] is None
+    assert result["mode"] == "quick"
+    assert result["limits"]["time_budget_seconds"] == QUICK_TIME_BUDGET
+    # Honest: exactly one explanatory finding, no fabricated checks.
+    assert len(result["findings"]) == 1
+    f = result["findings"][0]
+    assert f["check"] == "timeout"
+    for key in ("page", "severity", "title", "evidence",
+                "why_it_matters", "recommended_fix"):
+        assert f[key], f"timeout finding missing {key}"

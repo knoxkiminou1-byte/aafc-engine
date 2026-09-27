@@ -39,6 +39,7 @@ from __future__ import annotations
 import ipaddress
 import socket
 import threading
+import time
 import uuid
 from pathlib import Path
 from urllib.parse import urlparse
@@ -52,6 +53,16 @@ from aafc_engine.auditor import engine
 # ---------------------------------------------------------------------------
 QUICK_MAX_PAGES = 3
 QUICK_TIME_BUDGET = 40.0  # seconds; Vercel Hobby functions cap at 60s
+# Hard wall-clock cap for the whole audit call. The engine's own budget
+# (above) handles every *normal* slow case; this backstop covers the
+# pathological ones a per-request timeout cannot touch — a DNS resolver
+# that never answers (socket.getaddrinfo has no timeout parameter) or a
+# WAF that tarpits the connection by dribbling bytes slower than the
+# read timeout. Without it the function dies at Vercel's 60s kill and the
+# user gets a bare 504 instead of an honest PARTIAL. Must stay < 60.
+QUICK_HARD_CAP = 52.0
+_DNS_TIMEOUT = 5.0
+_DNS_TTL = 300.0
 
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
 
@@ -77,18 +88,58 @@ def _normalize_target(raw: str) -> str:
     return raw
 
 
+# ---------------------------------------------------------------------------
+# DNS with a timeout (the SSRF guard's other half)
+# ---------------------------------------------------------------------------
+_dns_cache: dict[str, tuple[float, set[str] | None]] = {}
+_dns_lock = threading.Lock()
+
+
+def _resolve_ips(hostname: str) -> set[str] | None:
+    """Resolve a hostname to its IP set, bounded by _DNS_TIMEOUT.
+
+    ``socket.getaddrinfo`` takes no timeout, so a wedged resolver would hang
+    the audit (and the serverless function) forever — this runs it on a
+    daemon thread and gives up after _DNS_TIMEOUT seconds. Results are
+    cached briefly; a failure/timeout caches as None so one bad resolver
+    cannot be hammered per fetch. Returns None when the host cannot be
+    resolved (treated as not-public by the guard: fail closed).
+    """
+    now = time.time()
+    with _dns_lock:
+        hit = _dns_cache.get(hostname)
+        if hit and hit[0] > now:
+            return hit[1]
+    box: dict = {}
+
+    def _do() -> None:
+        try:
+            box["infos"] = socket.getaddrinfo(hostname, None)
+        except OSError as exc:
+            box["error"] = exc
+
+    t = threading.Thread(target=_do, daemon=True)
+    t.start()
+    t.join(_DNS_TIMEOUT)
+    infos = box.get("infos")
+    if infos:
+        ips = {info[4][0] for info in infos}
+        with _dns_lock:
+            _dns_cache[hostname] = (now + _DNS_TTL, ips)
+        return ips
+    with _dns_lock:
+        _dns_cache[hostname] = (now + 30.0, None)
+    return None
+
+
 def _host_is_public(hostname: str) -> bool:
     """True when every resolved IP for the host is globally routable.
 
     Blocks loopback, private, link-local, multicast, reserved and
     unspecified addresses so the public endpoint cannot be used to probe
-    internal networks (SSRF).
+    internal networks (SSRF). Unresolvable hosts fail closed (False).
     """
-    try:
-        infos = socket.getaddrinfo(hostname, None)
-    except OSError:
-        return False
-    ips = {info[4][0] for info in infos}
+    ips = _resolve_ips(hostname)
     if not ips:
         return False
     for ip in ips:
@@ -133,6 +184,46 @@ def _fetch_guard(url: str) -> None:
 # ---------------------------------------------------------------------------
 # The real engine call
 # ---------------------------------------------------------------------------
+def _timeout_partial(url: str) -> dict:
+    """Honest PARTIAL envelope when the audit wedges past QUICK_HARD_CAP.
+
+    No score, no grade, no fabricated findings — just the truth: the site
+    stopped responding mid-audit (tarpitted connection or wedged resolver),
+    so nothing was verified. The caller must never present this as a result.
+    """
+    finding = {
+        "page": url, "check": "timeout", "severity": "warning",
+        "title": "Audit timed out — the site stopped responding",
+        "evidence": (f"The audit did not finish within {QUICK_HARD_CAP:.0f}s: "
+                     "the site's server stopped answering mid-audit "
+                     "(connection tarpitted or DNS wedged)."),
+        "why_it_matters": ("If an automated check cannot get a timely answer "
+                           "from the site, some visitors and search engines "
+                           "cannot either — every one of those visits is lost."),
+        "recommended_fix": ("Check that the site (or its firewall/CDN) is not "
+                            "rate-limiting or tarpitting automated checks, "
+                            "then re-run the audit."),
+        "technical": f"hard_cap={QUICK_HARD_CAP}s exceeded; no page verified",
+        "page_kind": "content", "verification": "HTTP_FETCH",
+        "review_hint": False,
+    }
+    return {
+        "audited_url": url,
+        "engine": "kiminou-website-audit/1.0",
+        "status": "PARTIAL",
+        "pages_crawled": 0,
+        "score": None,
+        "grade": None,
+        "counts": {"critical": 0, "warning": 1, "info": 0,
+                   "utility_page_findings_excluded_from_score": 0,
+                   "unverifiable_findings_excluded_from_score": 0},
+        "findings": [finding],
+        "mode": "quick",
+        "notes": ["Audit hit the hosted time cap before any page was verified; "
+                  "run the full CLI audit (aafc audit run) for the complete result."],
+    }
+
+
 def run_quick_audit(url: str,
                     max_pages: int = QUICK_MAX_PAGES,
                     time_budget: float = QUICK_TIME_BUDGET) -> dict:
@@ -144,14 +235,40 @@ def run_quick_audit(url: str,
 
     The SSRF fetch guard is enforced for every fetch the engine performs
     here (initial URL and all redirect targets).
+
+    The engine runs on a watchdog thread bounded by QUICK_HARD_CAP: if a
+    pathological target (tarpitted socket, wedged DNS) defeats the engine's
+    own per-request budget, the caller still gets an honest PARTIAL instead
+    of a bare 504 from the platform killing the function.
     """
-    with engine.fetch_guard(_fetch_guard):
-        result = engine.audit_site(
-            url,
-            max_pages=min(max_pages, QUICK_MAX_PAGES),
-            render=False,  # hosted path never ships a browser
-            time_budget=min(time_budget, QUICK_TIME_BUDGET),
-        )
+    box: dict = {}
+    done = threading.Event()
+
+    def _work() -> None:
+        try:
+            with engine.fetch_guard(_fetch_guard):
+                box["result"] = engine.audit_site(
+                    url,
+                    max_pages=min(max_pages, QUICK_MAX_PAGES),
+                    render=False,  # hosted path never ships a browser
+                    time_budget=min(time_budget, QUICK_TIME_BUDGET),
+                )
+        except Exception as exc:  # never let the worker die silently
+            box["error"] = exc
+        finally:
+            done.set()
+
+    worker = threading.Thread(target=_work, daemon=True)
+    worker.start()
+    finished = done.wait(QUICK_HARD_CAP)
+    if finished and "result" in box:
+        result = box["result"]
+    elif finished:
+        raise box.get("error", RuntimeError("audit worker failed"))
+    else:
+        # Worker is wedged (daemon thread: cannot block the response and
+        # dies with the instance). Report PARTIAL honestly.
+        result = _timeout_partial(url)
     result["mode"] = "quick"
     result["limits"] = {
         "max_pages": QUICK_MAX_PAGES,
