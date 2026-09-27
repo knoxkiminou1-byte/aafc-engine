@@ -42,8 +42,9 @@ function renderReport(payload) {
   const r = payload.result || {};
   const status = (payload.status || r.status || "UNKNOWN").toUpperCase();
   const badgeClass = status === "COMPLETE" ? "complete" : status === "PARTIAL" ? "partial" : "blocked";
+  const SEV_ORDER = { critical: 0, warning: 1, info: 2 };
   const findings = (r.findings || []).slice().sort((a, b) =>
-    ({ critical: 0, warning: 1, info: 2 }[a.severity] - { critical: 0, warning: 1, info: 2 }[b.severity]));
+    (SEV_ORDER[a.severity] ?? 3) - (SEV_ORDER[b.severity] ?? 3));
   // Count what the customer actually sees: every rendered finding card.
   // (The API's counts[] only covers score-driving findings; using it here
   // made the summary undercount the cards on screen.)

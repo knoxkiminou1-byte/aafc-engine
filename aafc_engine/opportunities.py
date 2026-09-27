@@ -57,7 +57,7 @@ def _collect_evidence_findings(store: Store, client_id: str) -> list[dict]:
     if complete:
         evidence.extend(complete[-1].get("findings", []))
     social_doc = store.read_json(client_id, "social.json", default=None) or {}
-    for profile in social_doc.get("profiles", []):
+    for profile in social_doc.get("profiles", []) or []:
         last_audit = profile.get("last_audit") or {}
         evidence.extend(last_audit.get("findings", []))
     evidence.extend(crosscheck.latest_crosscheck_findings(store, client_id))
@@ -88,8 +88,9 @@ def build_opportunity_map(
     Gathers website + social + crosscheck findings, runs
     :func:`services.match_services`, and creates one opportunity record
     per matched service. Dedupe: an existing opportunity with the same
-    service and the same set of triggering findings is not duplicated;
-    existing records keep their status and are otherwise refreshed.
+    service and the same underlying (check, page) problems -- keyed stably,
+    not by random per-audit finding IDs -- is not duplicated; existing
+    records keep their status.
 
     Args:
         store: The Store.
@@ -111,13 +112,33 @@ def build_opportunity_map(
     existing = _read_opportunities(store, client_id)
     built_at = utc_now_iso()
 
+    def _stable_key(service_slug: str, finding_ids: list[str]) -> str:
+        """Dedupe key from stable (check, page) pairs, not random IDs."""
+        pairs = sorted(
+            {
+                (
+                    str(findings_by_id.get(fid, {}).get("check", "")),
+                    str(findings_by_id.get(fid, {}).get("page", "")),
+                )
+                for fid in finding_ids
+            }
+        )
+        return service_slug + "::" + "|".join(f"{c}@{p}" for c, p in pairs)
+
     new_count = 0
     for match in matches:
         service = services.get_service(match["service"])
         triggering = sorted(match["triggered_by"])
+        dedupe_key = _stable_key(service["slug"], triggering)
         already = any(
-            o.get("service") == service["slug"]
-            and sorted(o.get("triggering_findings", [])) == triggering
+            o.get("dedupe_key") == dedupe_key
+            # Back-compat: opportunities written before dedupe_key existed
+            # fall back to the old exact-ID comparison.
+            or (
+                "dedupe_key" not in o
+                and o.get("service") == service["slug"]
+                and sorted(o.get("triggering_findings", [])) == triggering
+            )
             for o in existing
         )
         if already:
@@ -149,6 +170,7 @@ def build_opportunity_map(
             "pricing_model": service.get("pricing_model"),
             "status": "DISCOVERED",
             "triggering_findings": triggering,
+            "dedupe_key": dedupe_key,
             "created_at": built_at,
         }
         existing.append(opportunity)

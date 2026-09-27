@@ -99,7 +99,7 @@ def crosscheck(store: Store, client_id: str) -> list[dict]:
     website_list = websites.list_websites(store, client_id)
 
     social_doc = store.read_json(client_id, "social.json", default=None) or {}
-    profiles = social_doc.get("profiles", [])
+    profiles = social_doc.get("profiles", []) or []
     verified = [p for p in profiles if p.get("status") == "PUBLICLY VERIFIED"]
     website_url = social_doc.get("website_url", "")
     contact_signals = social_doc.get("contact_signals", {})

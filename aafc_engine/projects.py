@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .store import Store
+from .websites import WebsiteError, get_website
 
 PROJECT_STAGES = ["PROSPECT", "PROPOSAL", "ACTIVE", "DELIVERED", "MAINTENANCE", "CLOSED"]
 
@@ -41,6 +42,10 @@ def create_project(
 
     The stage must be one of PROJECT_STAGES. Raises ValueError on an invalid
     stage or a blank name, and KeyError when the client does not exist.
+
+    ``website_id`` and ``audit_id``, when given, are validated: they must
+    exist *and belong to this client* -- dangling or cross-client references
+    are refused so every project stays traceable to its own customer.
     """
     if stage not in PROJECT_STAGES:
         raise ValueError(f"invalid project stage: {stage!r}; must be one of {PROJECT_STAGES}")
@@ -48,6 +53,21 @@ def create_project(
         raise KeyError(f"client not found: {client_id}")
     if not name or not name.strip():
         raise ValueError("project name is required")
+    if website_id is not None:
+        try:
+            get_website(store, client_id, website_id)
+        except WebsiteError as exc:
+            raise ValueError(
+                f"website {website_id!r} does not exist for client {client_id!r}; "
+                "refusing a dangling project reference"
+            ) from exc
+    if audit_id is not None:
+        audit = store.read_json(client_id, "audits", f"{audit_id}.json", default=None)
+        if not isinstance(audit, dict):
+            raise ValueError(
+                f"audit {audit_id!r} does not exist for client {client_id!r}; "
+                "refusing a dangling project reference"
+            )
     now = _now()
     project = {
         "id": store.new_id("prj_"),

@@ -144,10 +144,27 @@ def cmd_website_authorize(args: argparse.Namespace, store: Store) -> tuple[dict,
 # audits
 # ---------------------------------------------------------------------------
 
+def _clamp_pages(pages: int) -> int:
+    """Clamp ``--pages`` to the sane operator range 1..12.
+
+    A typo'd ``--pages 1000000`` would otherwise become a runaway crawl.
+    The engine default is 6 pages; 12 is a generous manual ceiling.
+    """
+    try:
+        pages = int(pages)
+    except (TypeError, ValueError):
+        raise ValueError(f"--pages must be an integer, got {pages!r}")
+    if pages < 1 or pages > 12:
+        clamped = max(1, min(pages, 12))
+        print(f"warning: --pages {pages} clamped to {clamped} (allowed range 1-12)")
+        return clamped
+    return pages
+
+
 def cmd_audit_run(args: argparse.Namespace, store: Store) -> tuple[dict, str]:
     """Run the audit on an authorized website."""
     audit = audit_registry.run_audit(
-        store, args.client, args.website, max_pages=args.pages,
+        store, args.client, args.website, max_pages=_clamp_pages(args.pages),
         render=args.render,
     )
     return {"audit": audit}, (
@@ -614,7 +631,7 @@ def cmd_audit_full(args: argparse.Namespace, store: Store) -> tuple[dict, str]:
     # becomes "ERROR: ..." + exit 1 via main().
     websites.require_authorized(site)
     audit = audit_registry.run_audit(
-        store, client["id"], site["id"], max_pages=args.pages
+        store, client["id"], site["id"], max_pages=_clamp_pages(args.pages)
     )
     social_findings = social_audit.audit_social(store, client["id"])
     xcheck_findings = crosscheck.crosscheck(store, client["id"])

@@ -25,6 +25,22 @@ MONEY_KINDS = ["PROPOSAL", "INVOICE", "DEPOSIT", "PAYMENT", "BALANCE"]
 #: Statuses that assert someone owes money and therefore require evidence.
 RECEIVABLE_STATES = {"OWED", "EXPECTED", "OVERDUE"}
 
+#: Terminal statuses: a money event in one of these can never move again.
+TERMINAL_STATES = {"PAID", "CANCELLED"}
+
+#: Allowed status transitions. ``PAID`` and ``CANCELLED`` are terminal and
+#: have no outgoing edges; every other status maps to the statuses it may
+#: legally move to. Anything not listed here is refused.
+ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
+    "NEEDS_VERIFICATION": frozenset({"EXPECTED", "OWED", "CANCELLED"}),
+    "EXPECTED": frozenset({"OWED", "OVERDUE", "PARTIALLY_PAID", "PAID", "CANCELLED"}),
+    "OWED": frozenset({"OVERDUE", "PARTIALLY_PAID", "PAID", "CANCELLED"}),
+    "OVERDUE": frozenset({"PARTIALLY_PAID", "PAID", "CANCELLED"}),
+    "PARTIALLY_PAID": frozenset({"PAID", "CANCELLED"}),
+    "PAID": frozenset(),
+    "CANCELLED": frozenset(),
+}
+
 _MONEY_FILE = "money.json"
 
 
@@ -111,6 +127,11 @@ def record_event(
 
     amount_cents = _to_cents(amount_dollars)
     amount_paid_cents = _to_cents(amount_paid_dollars)
+    if amount_cents < 0 or amount_paid_cents < 0:
+        raise MoneyError(
+            "refusing to record a negative money amount "
+            f"(amount={amount_cents}c, paid={amount_paid_cents}c)"
+        )
     if status == "PARTIALLY_PAID":
         if not 0 < amount_paid_cents < amount_cents:
             raise MoneyError(
@@ -131,6 +152,8 @@ def record_event(
         "due_date": due_date,
         "notes": notes,
         "created_at": utc_now_iso(),
+        "updated_at": utc_now_iso(),
+        "status_history": [],
     }
     store.append_json_list(client_id, event, _MONEY_FILE)
     return event
@@ -169,6 +192,17 @@ def set_event_status(
             f"invalid money status {new_status!r}; expected one of {MONEY_STATES}"
         )
     event, events = _find_event(store, client_id, event_id)
+    old_status = event.get("status")
+
+    if new_status == old_status:
+        # Idempotent: re-applying the current status changes nothing.
+        return event
+    if new_status not in ALLOWED_TRANSITIONS.get(old_status, frozenset()):
+        raise MoneyError(
+            f"illegal money transition {old_status!r} -> {new_status!r}; "
+            f"allowed from {old_status!r}: "
+            f"{sorted(ALLOWED_TRANSITIONS.get(old_status, ())) or 'none (terminal)'}"
+        )
 
     if new_status in RECEIVABLE_STATES:
         effective = (evidence if evidence else event.get("evidence") or "")
@@ -204,6 +238,16 @@ def set_event_status(
         event["evidence"] = evidence
 
     event["status"] = new_status
+    event["updated_at"] = utc_now_iso()
+    history = event.setdefault("status_history", [])
+    if isinstance(history, list):
+        history.append(
+            {
+                "from": old_status,
+                "to": new_status,
+                "at": event["updated_at"],
+            }
+        )
     store.write_json(client_id, events, _MONEY_FILE)
     return event
 

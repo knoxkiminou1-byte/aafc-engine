@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -16,6 +17,32 @@ from typing import Any
 
 class StoreError(Exception):
     """Base error for store failures."""
+
+
+#: Client identifiers are always ``cl_`` + 12 hex chars (see ``new_id``).
+#: The store rejects anything else at the trust boundary so a hostile or
+#: mistyped ``client_id`` can never escape ``<root>/clients/``.
+_CLIENT_ID_RE = re.compile(r"^cl_[0-9a-f]{12}$")
+
+
+def _validate_client_id(client_id: str) -> None:
+    """Reject anything that is not a bare ``cl_<hex>`` client identifier."""
+    if not isinstance(client_id, str) or not _CLIENT_ID_RE.match(client_id):
+        raise StoreError(f"invalid client id: {client_id!r}")
+
+
+def _validate_parts(parts: tuple[str, ...]) -> None:
+    """Reject path parts that could escape the client directory."""
+    for part in parts:
+        if (
+            not isinstance(part, str)
+            or not part
+            or part in (".", "..")
+            or "/" in part
+            or "\\" in part
+            or part.startswith("~")
+        ):
+            raise StoreError(f"invalid path part: {part!r}")
 
 
 def utc_now_iso() -> str:
@@ -52,13 +79,19 @@ class Store:
 
         Returns:
             Path to ``<root>/clients/<client_id>``.
+
+        Raises:
+            StoreError: If ``client_id`` is not a valid client identifier.
         """
+        _validate_client_id(client_id)
         directory = self.root / "clients" / client_id
         directory.mkdir(parents=True, exist_ok=True)
         return directory
 
     def _read_path(self, client_id: str, parts: tuple[str, ...]) -> Path:
         """Path for a read; does not create directories."""
+        _validate_client_id(client_id)
+        _validate_parts(parts)
         return self.root.joinpath("clients", client_id, *parts)
 
     def read_json(
@@ -99,6 +132,7 @@ class Store:
             StoreError: If the write fails.
         """
         directory = self.client_dir(client_id)
+        _validate_parts(parts)
         path = directory.joinpath(*parts)
         if path.parent != directory:
             path.parent.mkdir(parents=True, exist_ok=True)

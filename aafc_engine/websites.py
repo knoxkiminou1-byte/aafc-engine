@@ -55,7 +55,11 @@ def normalize_url(url: str) -> str:
         port = parsed.port
     except ValueError:
         port = None
-    if port:
+    # Drop default ports and any userinfo: https://example.com:443 and
+    # https://example.com are the same website, and credentials embedded
+    # in a URL must never become part of the stored identity.
+    default_port = {"http": 80, "https": 443}.get(parsed.scheme)
+    if port and port != default_port:
         netloc = f"{host}:{port}"
     path = parsed.path or ""
     if path == "/":
@@ -77,9 +81,16 @@ def validate_url(url: str) -> str:
         The normalized URL.
 
     Raises:
-        WebsiteError: If the scheme is not http/https, or the host has no
-            dot (``localhost`` is allowed for tests).
+        WebsiteError: If the scheme is not http/https, the host has no
+            dot, or the host is a non-global IP literal (private, loopback,
+            link-local, etc.). ``localhost`` is allowed for tests.
+
+    Note: this is registration-time defense in depth. The authoritative
+    SSRF enforcement stays at fetch time (the hosted API's fetch guard
+    re-resolves every redirect target); DNS names are not resolved here.
     """
+    import ipaddress
+
     normalized = normalize_url(url)
     parsed = urlsplit(normalized)
     if parsed.scheme not in ("http", "https"):
@@ -89,6 +100,14 @@ def validate_url(url: str) -> str:
     host = parsed.hostname or ""
     if "." not in host and host != "localhost":
         raise WebsiteError(f"URL host looks invalid: {url!r}")
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        ip = None
+    if ip is not None and not ip.is_global:
+        raise WebsiteError(
+            f"URL host is not a public address: {url!r}"
+        )
     return normalized
 
 

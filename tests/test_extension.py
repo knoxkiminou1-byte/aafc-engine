@@ -298,3 +298,28 @@ def test_tg_honesty_no_padding(store):
     assert expansions["note"] == (
         "No catalog service is evidence-supported for expansion right now."
     )
+
+
+def test_th_private_ip_website_rejected(store):
+    """T-H: registering a private/loopback/link-local IP as a customer
+    website is refused at registration (defense in depth; the hosted API's
+    fetch guard remains the authoritative SSRF enforcement)."""
+    from aafc_engine import clients
+    from aafc_engine.websites import WebsiteError
+
+    customers.register_customer(store, "Private IP Test", "privateip@test.example")
+    cid = clients.find_client_by_email(store, "privateip@test.example")["id"]
+    for bad in (
+        "http://192.168.1.1/",
+        "http://10.0.0.5/admin",
+        "http://127.0.0.1:8000/",
+        "http://[::1]/",
+        "http://169.254.169.254/latest/meta-data/",
+    ):
+        with pytest.raises(WebsiteError):
+            websites.add_website(store, cid, bad)
+    # localhost stays allowed for tests; public hosts stay allowed
+    site, created = websites.add_website(store, cid, "http://localhost:1/")
+    assert created and site["url"].startswith("http://localhost")
+    site2, created2 = websites.add_website(store, cid, "https://example.com")
+    assert created2

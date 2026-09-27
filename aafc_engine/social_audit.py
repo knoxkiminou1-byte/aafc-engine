@@ -18,10 +18,10 @@ import uuid
 from typing import Any
 from urllib.parse import urlparse
 
-import requests
-
 from . import customers
+from . import safefetch
 from .store import Store, utc_now_iso
+from .websites import get_website, require_authorized
 
 UA = {
     "User-Agent": (
@@ -68,7 +68,7 @@ def _finding(
 
 
 def _fetch_profile(url: str) -> dict:
-    """GET a public profile URL (own tiny fetch; read-only).
+    """GET a public profile URL (SSRF-hardened shared fetcher; read-only).
 
     Args:
         url: Profile URL.
@@ -76,24 +76,16 @@ def _fetch_profile(url: str) -> dict:
     Returns:
         Dict with ``ok``, ``status``, ``text``, ``error``.
     """
-    try:
-        response = requests.get(url, headers=UA, timeout=TIMEOUT,
-                                allow_redirects=True)
-        return {
-            "ok": response.status_code == 200,
-            "status": response.status_code,
-            "text": response.text if response.status_code == 200 else "",
-            "error": None
-            if response.status_code == 200
-            else f"HTTP {response.status_code}",
-        }
-    except requests.RequestException as exc:
-        return {
-            "ok": False,
-            "status": None,
-            "text": "",
-            "error": f"{type(exc).__name__}: {exc}",
-        }
+    result = safefetch.safe_get(url, timeout=TIMEOUT, user_agent=UA)
+    ok = result["ok"] and result["status"] == 200
+    return {
+        "ok": ok,
+        "status": result["status"],
+        "text": result["text"] if ok else "",
+        "error": result["error"] if result["error"] else (
+            None if ok else f"HTTP {result['status']}"
+        ),
+    }
 
 
 def _page_title(text: str) -> str:
@@ -110,7 +102,8 @@ def audit_social(store: Store, client_id: str) -> list[dict]:
     For each verified profile: (1) reachability check, (2) website-linkback
     check (only when the fetch succeeded), (3) branding/bio signals (only
     from fetched HTML). Results are stored under each profile's
-    ``"last_audit"`` key in ``social.json``. Logs ``"social_audited"``.
+    ``"last_audit"`` key in ``social.json`` (every run is also appended to
+    the profile's ``"audit_history"``). Logs ``"social_audited"``.
 
     Args:
         store: The Store.
@@ -126,7 +119,7 @@ def audit_social(store: Store, client_id: str) -> list[dict]:
             store, client_id, "social_audited", "no footprint discovery on record"
         )
         return []
-    profiles = social_doc.get("profiles", [])
+    profiles = social_doc.get("profiles", []) or []
     verified = [
         p for p in profiles
         if p.get("status") == "PUBLICLY VERIFIED" and p.get("url")
@@ -134,6 +127,11 @@ def audit_social(store: Store, client_id: str) -> list[dict]:
     website_id = social_doc.get("website_id")
     website_url = social_doc.get("website_url", "")
     website_host = urlparse(website_url).netloc.lower()
+    if website_id:
+        # The footprint was discovered from this website: auditing the
+        # social profiles derived from it requires the same authorization
+        # as auditing the website itself.
+        require_authorized(get_website(store, client_id, website_id))
 
     client = store.read_json(client_id, "client.json", default={}) or {}
     business_name = (client.get("business_name") or "").strip()
@@ -272,7 +270,12 @@ def audit_social(store: Store, client_id: str) -> list[dict]:
                 )
             )
 
-        profile["last_audit"] = {"audited_at": audited_at, "findings": findings}
+        # Append-only per-profile history; last_audit stays the latest run.
+        run_record = {"audited_at": audited_at, "findings": findings}
+        profile["last_audit"] = run_record
+        history = profile.setdefault("audit_history", [])
+        if isinstance(history, list):
+            history.append(run_record)
         all_findings.extend(findings)
 
     store.write_json(client_id, social_doc, "social.json")

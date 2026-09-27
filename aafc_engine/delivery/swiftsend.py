@@ -18,5 +18,5 @@ class SwiftSendDelivery(DeliveryProvider):
         raise NotImplementedError(
             "SwiftSend delivery is BLOCKED: no SwiftSend API exists in this workspace. "
             "Needed before implementation: API base URL, auth scheme, and endpoint "
-            "contract from Kiminou's mom."
+            "contract from the account owner."
         )

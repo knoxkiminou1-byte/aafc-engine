@@ -165,6 +165,14 @@ def update_client(store: Store, client_id: str, **fields: Any) -> dict:
     """Update mutable fields on a client record.
 
     The ``id`` and ``created_at`` fields are protected and cannot be changed.
+    ``record_type`` is protected as well: promotion goes through
+    :func:`promote_to_client` only, so an update can never silently demote a
+    client or fabricate a promotion.
+
+    Changing ``email`` re-runs the same validation as creation: the new
+    address must be a valid shape and must not already belong to a *different*
+    client, otherwise a lookup by email could load the wrong customer's
+    filing cabinet.
 
     Args:
         store: The Store.
@@ -176,10 +184,21 @@ def update_client(store: Store, client_id: str, **fields: Any) -> dict:
 
     Raises:
         ClientNotFoundError: If the client does not exist.
+        ValueError: On an invalid email, or an email collision with another
+            client.
     """
     client = get_client(store, client_id)
-    for protected in ("id", "created_at"):
+    for protected in ("id", "created_at", "record_type"):
         fields.pop(protected, None)
+    if "email" in fields:
+        new_email = _validate_email(fields["email"])
+        other = find_client_by_email(store, new_email)
+        if other is not None and other.get("id") != client_id:
+            raise ValueError(
+                f"email {new_email!r} already belongs to client "
+                f"{other.get('id')!r}; refusing to create a collision"
+            )
+        fields["email"] = new_email
     client.update(fields)
     client["updated_at"] = utc_now_iso()
     store.write_json(client_id, client, _CLIENT_FILE)

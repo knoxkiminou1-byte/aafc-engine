@@ -77,6 +77,8 @@ _MAX_JOBS = 128
 # URL validation + SSRF guard
 # ---------------------------------------------------------------------------
 def _normalize_target(raw: str) -> str:
+    if not isinstance(raw, str):
+        raise ValueError("URL must be a string, e.g. https://example.com")
     raw = (raw or "").strip()
     if not raw:
         raise ValueError("Provide a website URL to audit.")
@@ -93,6 +95,21 @@ def _normalize_target(raw: str) -> str:
 # ---------------------------------------------------------------------------
 _dns_cache: dict[str, tuple[float, set[str] | None]] = {}
 _dns_lock = threading.Lock()
+_DNS_CACHE_MAX = 1000  # bounded: a shared function must not grow this forever
+
+
+def _cache_ips(hostname: str, ips: set[str] | None, ttl: float) -> None:
+    """Store a DNS result with a bounded cache size."""
+    now = time.time()
+    with _dns_lock:
+        if len(_dns_cache) >= _DNS_CACHE_MAX:
+            # Evict expired entries first, then oldest regardless.
+            expired = [h for h, (exp, _) in _dns_cache.items() if exp <= now]
+            for h in expired:
+                del _dns_cache[h]
+            while len(_dns_cache) >= _DNS_CACHE_MAX:
+                _dns_cache.pop(next(iter(_dns_cache)))
+        _dns_cache[hostname] = (now + ttl, ips)
 
 
 def _resolve_ips(hostname: str) -> set[str] | None:
@@ -124,11 +141,9 @@ def _resolve_ips(hostname: str) -> set[str] | None:
     infos = box.get("infos")
     if infos:
         ips = {info[4][0] for info in infos}
-        with _dns_lock:
-            _dns_cache[hostname] = (now + _DNS_TTL, ips)
+        _cache_ips(hostname, ips, _DNS_TTL)
         return ips
-    with _dns_lock:
-        _dns_cache[hostname] = (now + 30.0, None)
+    _cache_ips(hostname, None, 30.0)
     return None
 
 
@@ -204,7 +219,10 @@ def _timeout_partial(url: str) -> dict:
                             "rate-limiting or tarpitting automated checks, "
                             "then re-run the audit."),
         "technical": f"hard_cap={QUICK_HARD_CAP}s exceeded; no page verified",
-        "page_kind": "content", "verification": "HTTP_FETCH",
+        # NOT "HTTP_FETCH": the fetch never completed, so claiming HTTP
+        # verification would be a lie. This finding reports an unmeasured
+        # timeout, nothing more.
+        "page_kind": "content", "verification": "NONE",
         "review_hint": False,
     }
     return {
@@ -303,8 +321,53 @@ def get_job(job_id: str) -> dict | None:
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Per-IP rate limit for POST /api/audit (sliding window, in-memory)
+# ---------------------------------------------------------------------------
+# Each audit burns CPU/network on our serverless function, so an abusive
+# client must not be able to fire audits without bound. This is a
+# per-instance guard (Vercel can run several instances; cold starts reset
+# the window), honest about what it is: it stops casual abuse, not a
+# determined distributed flood. Limits: 10 audit starts per rolling 60s
+# per client IP. Exceeding returns HTTP 429 with Retry-After.
+_RATE_LIMIT = 10
+_RATE_WINDOW = 60.0
+_rate_hits: dict[str, list[float]] = {}
+_rate_lock = threading.Lock()
+
+
+def _rate_limited(ip: str) -> tuple[bool, float]:
+    """Check-and-record one POST /api/audit attempt for ``ip``.
+
+    Returns (limited, retry_after_seconds).
+    """
+    now = time.time()
+    with _rate_lock:
+        hits = [t for t in _rate_hits.get(ip, []) if t > now - _RATE_WINDOW]
+        if len(hits) >= _RATE_LIMIT:
+            retry_after = max(1.0, hits[0] + _RATE_WINDOW - now)
+            _rate_hits[ip] = hits
+            return True, retry_after
+        hits.append(now)
+        _rate_hits[ip] = hits
+        return False, 0.0
+
+
 @app.route("/api/audit", methods=["POST"])
 def api_audit_post():
+    client_ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip() \
+        or request.remote_addr or "unknown"
+    limited, retry_after = _rate_limited(client_ip)
+    if limited:
+        response = jsonify({
+            "error": (
+                "Rate limit exceeded: too many audit requests from this address. "
+                "Please wait a moment and try again."
+            )
+        })
+        response.status_code = 429
+        response.headers["Retry-After"] = str(int(retry_after) + 1)
+        return response
     data = request.get_json(force=False, silent=True) or {}
     raw_url = data.get("url", "")
     try:

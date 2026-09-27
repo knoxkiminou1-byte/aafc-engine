@@ -88,7 +88,7 @@ def get_customer_file(store: Store, email_or_client_id: str) -> dict:
     source = sources.get_source(store, client_id)
     website_list = websites.list_websites(store, client_id)
     social_doc = store.read_json(client_id, "social.json", default={}) or {}
-    social_profiles = social_doc.get("profiles", [])
+    social_profiles = social_doc.get("profiles", []) or []
     audits = audit_registry.list_audits(store, client_id)
     findings_all = [
         finding for audit in audits for finding in audit.get("findings", [])
@@ -356,9 +356,16 @@ def log_communication(
         The appended communication dict.
     """
     clients.get_client(store, client_id)  # raises if unknown
+    if direction not in ("inbound", "outbound"):
+        raise ValueError(
+            f"invalid communication direction {direction!r}; "
+            "must be 'inbound' or 'outbound'"
+        )
+    if not (channel or "").strip():
+        raise ValueError("communication channel is required")
     entry = {
         "id": store.new_id("com_"),
-        "channel": channel,
+        "channel": channel.strip(),
         "direction": direction,
         "subject": subject,
         "body_ref": body_ref,

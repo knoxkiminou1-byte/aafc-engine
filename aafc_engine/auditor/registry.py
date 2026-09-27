@@ -154,8 +154,18 @@ def run_audit(store: Any, client_id: str, website_id: str, max_pages: int = 6,
     website = get_website(store, client_id, website_id)
     require_authorized(website)  # raises NotAuthorizedError when not authorized
 
+    if not isinstance(max_pages, int) or max_pages < 1:
+        raise ValueError(f"max_pages must be a positive integer, got {max_pages!r}")
+
     url = website["url"]
-    version = len(list_audits(store, client_id, website_id)) + 1
+    # Monotonic version: max(existing) + 1, so deleting an old audit file
+    # can never cause a version collision with a surviving audit.
+    existing_versions = [
+        a.get("version", 0)
+        for a in list_audits(store, client_id, website_id)
+        if isinstance(a.get("version"), int)
+    ]
+    version = (max(existing_versions) if existing_versions else 0) + 1
     audit_id = store.new_id("aud_")
     started_at = datetime.now(timezone.utc).isoformat()
 

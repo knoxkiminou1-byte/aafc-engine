@@ -35,7 +35,25 @@ ENGINE_CHECKS = frozenset({
 })
 
 #: Check names a service's evidence_triggers may reference.
-KNOWN_CHECKS = ENGINE_CHECKS | frozenset(crosscheck.XCHECK_NAMES)
+#:
+#: Social checks are ``social_<platform>_<aspect>`` as emitted by
+#: ``social_audit`` (platforms from ``footprint.PLATFORMS``, aspects
+#: reachable / website_linkback / branding). They are real evidence --
+#: a missing or broken social presence is a legitimate trigger for the
+#: social-media-system and content-system services.
+_SOCIAL_PLATFORMS = (
+    "instagram", "facebook", "linkedin", "youtube",
+    "tiktok", "x", "google_business", "directories",
+)
+_SOCIAL_ASPECTS = ("reachable", "website_linkback", "branding")
+SOCIAL_CHECKS = frozenset(
+    f"social_{platform}_{aspect}"
+    for platform in _SOCIAL_PLATFORMS
+    for aspect in _SOCIAL_ASPECTS
+)
+KNOWN_CHECKS = (
+    ENGINE_CHECKS | frozenset(crosscheck.XCHECK_NAMES) | SOCIAL_CHECKS
+)
 
 _CATALOG_PATH = Path(__file__).resolve().parent / "data" / "services.yaml"
 

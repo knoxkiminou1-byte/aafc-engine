@@ -21,11 +21,10 @@ from html.parser import HTMLParser
 from typing import Any
 from urllib.parse import urlparse
 
-import requests
-
 from . import customers
+from . import safefetch
 from .store import Store, utc_now_iso
-from .websites import get_website
+from .websites import get_website, require_authorized
 
 UA = {"User-Agent": "AAFC-Footprint-Discovery/1.0 (read-only; public web)"}
 TIMEOUT = 12
@@ -62,7 +61,7 @@ class _LinkParser(HTMLParser):
 
 
 def _fetch_homepage(url: str) -> dict:
-    """Fetch a homepage with a plain GET (own tiny fetch, no auditor import).
+    """Fetch a homepage with the SSRF-hardened shared fetcher.
 
     Args:
         url: Homepage URL.
@@ -70,25 +69,14 @@ def _fetch_homepage(url: str) -> dict:
     Returns:
         Dict with ``ok``, ``status``, ``text``, ``final_url``, ``error``.
     """
-    try:
-        response = requests.get(
-            url, headers=UA, timeout=TIMEOUT, allow_redirects=True
-        )
-        return {
-            "ok": True,
-            "status": response.status_code,
-            "text": response.text,
-            "final_url": response.url,
-            "error": None,
-        }
-    except requests.RequestException as exc:
-        return {
-            "ok": False,
-            "status": None,
-            "text": "",
-            "final_url": url,
-            "error": f"{type(exc).__name__}: {exc}",
-        }
+    result = safefetch.safe_get(url, timeout=TIMEOUT, user_agent=UA)
+    return {
+        "ok": result["ok"],
+        "status": result["status"],
+        "text": result["text"],
+        "final_url": result["final_url"],
+        "error": result["error"],
+    }
 
 
 def _matches_platform(netloc: str, patterns: list[str]) -> bool:
@@ -126,6 +114,7 @@ def discover(store: Store, client_id: str, website_id: str) -> list[dict]:
         :data:`PLATFORMS`.
     """
     website = get_website(store, client_id, website_id)
+    require_authorized(website)
     homepage = website["url"]
 
     fetch_result = _fetch_homepage(homepage)

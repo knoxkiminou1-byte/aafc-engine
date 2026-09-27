@@ -11,6 +11,8 @@ from __future__ import annotations
 import uuid
 from typing import Any
 
+from .store import utc_now_iso
+
 SEVERITIES: list[str] = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "PASS"]
 # FIX 7: NEEDS_RENDERED_REVIEW — the raw-HTML evidence contradicts what a
 # browser renders (e.g. img-alt counts inflated by hidden/duplicate markup);
@@ -41,7 +43,7 @@ SEVERITY_MAP: dict[str, str] = {
 #   fetch, http_status, https, hsts, mixed_content, indexability,
 #   title, meta_description, viewport, charset, h1, heading_order, img_alt,
 #   canonical, open_graph, structured_data, lang, forms, cta, page_weight,
-#   ttfb, robots_txt, sitemap, broken_links, parse
+#   ttfb, robots_txt, sitemap, broken_links, parse, bot_protection
 #
 # Rules:
 #   CONFIRMED            -- directly measured technical facts: HTTP status /
@@ -92,6 +94,11 @@ _LIKELY_CHECKS = frozenset(
 CONFIDENCE_BY_CHECK: dict[str, str] = {
     **{name: "CONFIRMED" for name in _CONFIRMED_CHECKS},
     **{name: "LIKELY" for name in _LIKELY_CHECKS},
+    # FIX 9: bot_protection is a *refused measurement*, not a site defect.
+    # The refusal itself is directly observed (HTTP 403/429 + bot-wall
+    # markers), so the finding is CONFIRMED -- it asserts "we could not
+    # measure", never a fake site fact.
+    "bot_protection": "CONFIRMED",
 }
 
 DEFAULT_CONFIDENCE = "NEEDS MANUAL REVIEW"
@@ -169,8 +176,50 @@ def _iter_audit_files(store: Any, client_id: str):
             yield path.stem, audit
 
 
+#: Per-client lifecycle overlay: ``finding_status.json`` maps
+#: ``finding_id -> {"status": ..., "history": [{"from", "to", "at"}]}``.
+#: The lifecycle status (RECOMMENDED / VERIFIED / ...) is operational state,
+#: NOT audit-run history -- so it lives in this overlay and the saved audit
+#: JSON files stay append-only and always reflect what the audit actually
+#: found (status "FOUND").
+_STATUS_FILE = "finding_status.json"
+
+
+def _load_status_overlay(store: Any, client_id: str) -> dict[str, Any]:
+    overlay = store.read_json(client_id, _STATUS_FILE, default={})
+    return overlay if isinstance(overlay, dict) else {}
+
+
+def _save_status_overlay(store: Any, client_id: str, overlay: dict[str, Any]) -> None:
+    store.write_json(client_id, overlay, _STATUS_FILE)
+
+
+def get_finding_status(store: Any, client_id: str, finding_id: str) -> str:
+    """Return the finding's current lifecycle status.
+
+    The overlay wins; a finding with no overlay entry is still at its
+    audit-time status (``FOUND``).
+
+    Args:
+        store: The Store.
+        client_id: The client identifier.
+        finding_id: The finding identifier.
+
+    Returns:
+        The current lifecycle status string.
+    """
+    entry = _load_status_overlay(store, client_id).get(finding_id)
+    if isinstance(entry, dict) and entry.get("status") in FINDING_STATES:
+        return entry["status"]
+    return "FOUND"
+
+
 def get_finding(store: Any, client_id: str, finding_id: str) -> dict[str, Any]:
     """Find a finding by id across all of a client's saved audits.
+
+    The returned dict carries the finding's *current lifecycle* status
+    (merged from the status overlay); the saved audit files themselves are
+    never rewritten, so the audit-time record stays pristine.
 
     Raises:
         KeyError: if no finding with that id exists for the client.
@@ -178,14 +227,21 @@ def get_finding(store: Any, client_id: str, finding_id: str) -> dict[str, Any]:
     for _audit_id, audit in _iter_audit_files(store, client_id):
         for finding in audit.get("findings", []):
             if isinstance(finding, dict) and finding.get("id") == finding_id:
-                return finding
+                merged = dict(finding)
+                merged["status"] = get_finding_status(store, client_id, finding_id)
+                return merged
     raise KeyError(f"finding not found: {finding_id!r}")
 
 
 def set_finding_status(
     store: Any, client_id: str, finding_id: str, status: str
 ) -> dict[str, Any]:
-    """Set a finding's lifecycle status and rewrite the owning audit file.
+    """Set a finding's lifecycle status in the status overlay.
+
+    The saved audit files are append-only: this writes to
+    ``finding_status.json`` (with a full from/to/at history) and never
+    rewrites the owning audit file, so audit #1's file always reflects what
+    audit #1 actually found.
 
     Raises:
         ValueError: if ``status`` is not in :data:`FINDING_STATES`.
@@ -195,13 +251,22 @@ def set_finding_status(
         raise ValueError(
             f"invalid finding status {status!r}; must be one of {FINDING_STATES}"
         )
-    for audit_id, audit in _iter_audit_files(store, client_id):
-        for finding in audit.get("findings", []):
-            if isinstance(finding, dict) and finding.get("id") == finding_id:
-                finding["status"] = status
-                store.write_json(client_id, audit, "audits", f"{audit_id}.json")
-                return finding
-    raise KeyError(f"finding not found: {finding_id!r}")
+    # Raises KeyError if the finding does not exist for this client.
+    finding = get_finding(store, client_id, finding_id)
+    old_status = get_finding_status(store, client_id, finding_id)
+    overlay = _load_status_overlay(store, client_id)
+    entry = overlay.get(finding_id)
+    if not isinstance(entry, dict):
+        entry = {"status": old_status, "history": []}
+    history = entry.setdefault("history", [])
+    if isinstance(history, list):
+        history.append({"from": old_status, "to": status, "at": utc_now_iso()})
+    entry["status"] = status
+    overlay[finding_id] = entry
+    _save_status_overlay(store, client_id, overlay)
+    merged = dict(finding)
+    merged["status"] = status
+    return merged
 
 
 def finding_key(finding: dict[str, Any]) -> tuple[str, str]:

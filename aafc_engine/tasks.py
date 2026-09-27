@@ -60,7 +60,9 @@ def create_task(
         "notes": notes or "",
         "status": "TODO",
         "created_at": _now(),
+        "updated_at": _now(),
         "completed_at": None,
+        "status_history": [],
     }
     store.append_json_list(client_id, task, "tasks.json")
     return task
@@ -89,20 +91,27 @@ def set_task_status(
 ) -> dict[str, Any]:
     """Set a task's status.
 
-    Status must be one of TASK_STATES, else ValueError. Moving to DONE stamps
-    completed_at; moving away from DONE clears it. Raises KeyError when the
-    task does not exist.
+    Status must be one of TASK_STATES, else ValueError. The first move to
+    DONE stamps ``completed_at`` and it is never cleared or rewritten
+    afterwards -- a task that was done, reopened, and done again keeps its
+    original completion time honestly. Every transition is appended to
+    ``status_history`` (from/to/at), and ``updated_at`` is stamped.
+    Raises KeyError when the task does not exist.
     """
     if status not in TASK_STATES:
         raise ValueError(f"invalid task status: {status!r}; must be one of {TASK_STATES}")
     tasks = _load_tasks(store, client_id)
     for task in tasks:
         if task.get("id") == task_id:
+            old = task.get("status")
+            now = _now()
             task["status"] = status
             if status == "DONE" and not task.get("completed_at"):
-                task["completed_at"] = _now()
-            elif status != "DONE":
-                task["completed_at"] = None
+                task["completed_at"] = now
+            task["updated_at"] = now
+            history = task.setdefault("status_history", [])
+            if isinstance(history, list):
+                history.append({"from": old, "to": status, "at": now})
             _save_tasks(store, client_id, tasks)
             return task
     raise KeyError(f"task not found: {task_id}")

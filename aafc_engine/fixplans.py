@@ -46,6 +46,10 @@ def create_fix_plan(
         {id, client_id, audit_id, project_id, created_at, updated_at,
          items: [{finding_id, task_id, state}]}
 
+    Idempotent per audit: re-running for the same audit skips findings an
+    earlier plan already covers; when nothing new remains, the existing plan
+    is returned unchanged (no duplicate tasks).
+
     Raises ValueError when the audit or the (given) project does not exist.
     """
     audit = store.read_json(client_id, "audits", f"{audit_id}.json")
@@ -59,11 +63,28 @@ def create_fix_plan(
         except KeyError as exc:
             raise ValueError(f"project not found: {project_id}") from exc
 
+    # Idempotency: findings already covered by an earlier plan for this
+    # audit are skipped, so re-running the command never doubles the task
+    # list. If every actionable finding is already covered, the existing
+    # plan is returned unchanged.
+    covered: set[str] = set()
+    prior_plan: dict[str, Any] | None = None
+    for existing in _load_plans(store, client_id):
+        if existing.get("audit_id") == audit_id:
+            prior_plan = existing
+            for item in existing.get("items", []):
+                finding_id = item.get("finding_id")
+                if finding_id:
+                    covered.add(finding_id)
+
     items: list[dict[str, Any]] = []
     for finding in audit.get("findings", []):
         if finding.get("severity") not in PLAN_SEVERITIES:
             continue
         if finding.get("result") != "FAIL":
+            continue
+        finding_id = finding.get("id")
+        if finding_id in covered:
             continue
         notes = (
             MANUAL_REVIEW_NOTE
@@ -87,6 +108,9 @@ def create_fix_plan(
         )
 
     now = _now()
+    if not items and prior_plan is not None:
+        # Nothing new to plan: return the existing plan unchanged.
+        return prior_plan
     plan = {
         "id": store.new_id("fix_"),
         "client_id": client_id,
@@ -198,14 +222,14 @@ _IMPLEMENTATION_PATHS: dict[str, str] = {
         "3. Redeploy and reload the page; confirm the browser shows no mixed-content warnings. "
         "4. Re-run the mixed_content check."
     ),
-    "broken_link": (
+    "broken_links": (
         "1. Identify the source page and the dead destination URL from the evidence. "
         "2. Fix the destination URL, point the link at a live replacement, or remove the link "
         "if the target no longer exists. "
         "3. Deploy the change. "
         "4. Re-run the link check and confirm the destination returns 200."
     ),
-    "robots": (
+    "robots_txt": (
         "1. Open /robots.txt and read the Disallow rules. "
         "2. Remove or narrow any rule that blocks pages meant to be indexed; keep admin/login "
         "paths disallowed. "
@@ -227,15 +251,19 @@ _IMPLEMENTATION_PATHS: dict[str, str] = {
         "page offers. "
         "2. Deploy and re-crawl; confirm each page has its own description."
     ),
-    "headings": (
-        "1. Restructure the page so it has exactly one H1, with H2/H3 sections nested logically "
-        "and no skipped levels. "
-        "2. Deploy and re-run the headings check to confirm the hierarchy is clean."
+    "h1": (
+        "1. Give the page exactly one H1 that names the page topic and the business. "
+        "2. Deploy and re-run the h1 check to confirm a single H1 is present."
     ),
-    "alt_text": (
+    "heading_order": (
+        "1. Restructure headings so H2/H3 sections nest logically under the H1 with no "
+        "skipped levels. "
+        "2. Deploy and re-run the heading_order check to confirm the hierarchy is clean."
+    ),
+    "img_alt": (
         "1. Add concise, descriptive alt text to every informative image (empty alt=\"\" for "
         "purely decorative images). "
-        "2. Deploy and re-run the alt_text check to confirm coverage."
+        "2. Deploy and re-run the img_alt check to confirm coverage."
     ),
     "canonical": (
         "1. Add <link rel=\"canonical\"> with the preferred absolute URL to each affected page. "
@@ -266,16 +294,22 @@ _IMPLEMENTATION_PATHS: dict[str, str] = {
         "3. Fix the form handler/endpoint for anything that failed, redeploy, and re-test "
         "until a submission completes cleanly."
     ),
-    "performance": (
+    "page_weight": (
         "1. Measure the page with a speed testing tool and note the slowest resources. "
         "2. Compress/convert images, minify CSS/JS, enable caching, and lazy-load below-the-fold media. "
-        "3. Re-measure and confirm the scores improved; re-run the performance check."
+        "3. Re-measure and confirm the scores improved; re-run the page_weight check."
     ),
-    "mobile": (
+    "ttfb": (
+        "1. Measure time-to-first-byte from several locations; rule out DNS and TLS handshake "
+        "overhead first. "
+        "2. Fix slow server-side work (uncached queries, cold functions), enable caching or a CDN. "
+        "3. Re-run the ttfb check and confirm the response starts faster."
+    ),
+    "viewport": (
         "1. Confirm the viewport meta tag is present and the layout is responsive: no horizontal "
         "scroll, readable text, tap targets at least ~44px. "
         "2. Fix the CSS/layout issues found. "
-        "3. Test on a real phone and re-run the mobile check."
+        "3. Test on a real phone and re-run the viewport check."
     ),
     "trust": (
         "1. Add visible trust signals: business name, phone/email, physical address, customer "
@@ -289,10 +323,37 @@ _IMPLEMENTATION_PATHS: dict[str, str] = {
         "2. Remove filler and duplicated boilerplate. "
         "3. Re-crawl and confirm the content is substantive and unique."
     ),
-    "indexing": (
+    "indexability": (
         "1. Confirm the page has no noindex directive and is allowed by robots.txt. "
         "2. Request indexing in Search Console after fixes are deployed. "
         "3. Confirm the page appears in the search index."
+    ),
+    "hsts": (
+        "1. Confirm the site serves over HTTPS, then add (or fix) the Strict-Transport-Security "
+        "header with a long max-age; consider includeSubDomains and preload once stable. "
+        "2. Deploy and re-run the hsts check to confirm the header is present and valid."
+    ),
+    "charset": (
+        "1. Declare the page encoding once, early in <head> (e.g. <meta charset=\"utf-8\">), "
+        "and make sure the server sends a matching Content-Type charset. "
+        "2. Deploy and re-run the charset check."
+    ),
+    "lang": (
+        "1. Add the lang attribute to the <html> tag matching the page's actual language "
+        "(e.g. lang=\"en\"). "
+        "2. Deploy and re-run the lang check."
+    ),
+    "parse": (
+        "1. Open the page source and find the malformed markup flagged in the evidence. "
+        "2. Fix the broken tags/structure so the document parses cleanly. "
+        "3. Re-run the parse check."
+    ),
+    "bot_protection": (
+        "1. This is a refused measurement, not a site defect: the server blocked automated "
+        "fetching (bot protection / rate limit). "
+        "2. To get a real measurement, audit from an allowlisted IP, add a crawl allowance "
+        "for the auditor's user agent, or run the audit from the operator's machine. "
+        "3. Re-run the audit; confirm the pages now measure instead of refusing."
     ),
 }
 
@@ -307,11 +368,12 @@ _DEFAULT_IMPLEMENTATION_PATH = (
 def implementation_path_for(finding: dict[str, Any]) -> str:
     """Return concrete implementation steps for a finding's check.
 
-    Covers the standard check names (fetch, http_status, https,
-    mixed_content, broken_link, robots, sitemap, title, meta_description,
-    headings, alt_text, canonical, open_graph, structured_data, cta, forms,
-    performance, mobile, trust, content, indexing). Unknown checks get a
-    generic but actionable path.
+    Keys are the REAL check names emitted by the vendored engine
+    (``aafc_engine/auditor/engine.py``): fetch, http_status, https, hsts,
+    mixed_content, indexability, title, meta_description, viewport, charset,
+    h1, heading_order, img_alt, canonical, open_graph, structured_data, lang,
+    forms, cta, page_weight, ttfb, robots_txt, sitemap, broken_links, parse,
+    bot_protection. Unknown checks get a generic but actionable path.
     """
     check = (finding or {}).get("check", "")
     return _IMPLEMENTATION_PATHS.get(check, _DEFAULT_IMPLEMENTATION_PATH)
