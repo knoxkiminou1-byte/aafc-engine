@@ -64,7 +64,12 @@ No invented data at any step. No customer email sent.
 
 ## Production deployment
 
-_Pending: commit, push, Vercel verification, rendered-browser check._
+- **Live site:** `https://aafc-engine.vercel.app` — verified responding 2026-09-27
+  (HTTP 200, audit API returns real results for example.com).
+- **Currently deployed commit:** `349bc79` (pre-hardening baseline).
+- **Hardening commit:** `9208dc3` — committed locally, **push pending**.
+  No GitHub credentials were available at push time; the push needs a
+  token. Once pushed, Vercel will auto-deploy (or trigger manually).
 
 ## Standing rules (do not regress)
 
