@@ -42,9 +42,14 @@ function renderReport(payload) {
   const r = payload.result || {};
   const status = (payload.status || r.status || "UNKNOWN").toUpperCase();
   const badgeClass = status === "COMPLETE" ? "complete" : status === "PARTIAL" ? "partial" : "blocked";
-  const c = r.counts || { critical: 0, warning: 0, info: 0 };
   const findings = (r.findings || []).slice().sort((a, b) =>
     ({ critical: 0, warning: 1, info: 2 }[a.severity] - { critical: 0, warning: 1, info: 2 }[b.severity]));
+  // Count what the customer actually sees: every rendered finding card.
+  // (The API's counts[] only covers score-driving findings; using it here
+  // made the summary undercount the cards on screen.)
+  const nCrit = findings.filter(f => f.severity === "critical").length;
+  const nWarn = findings.filter(f => f.severity === "warning").length;
+  const nInfo = findings.filter(f => f.severity === "info").length;
 
   let html = "<h2>Audit report</h2>";
   html += "<p><span class='badge " + badgeClass + "'>" + esc(status) + "</span> " +
@@ -59,15 +64,16 @@ function renderReport(payload) {
     else html += "<span class='grade'>–</span>";
     html += "</div>";
     if (status === "PARTIAL") {
-      html += "<p><em>Partial audit:</em> the time budget ran out before every page was checked, " +
+      html += "<p><em>Partial audit:</em> this audit couldn't check everything it set out to " +
+              "— the time budget ran out or some pages refused automated checks — " +
               "so this score covers only the pages completed and the final grade is withheld. " +
               "Run the full CLI audit for the complete result.</p>";
     }
   }
 
   html += "<p>Checked <strong>" + esc(r.pages_crawled) + "</strong> page(s) in " +
-          esc(r.elapsed_total) + "s — <strong>" + esc(c.critical) + "</strong> critical, " +
-          "<strong>" + esc(c.warning) + "</strong> warnings, <strong>" + esc(c.info) +
+          esc(r.elapsed_total) + "s — <strong>" + esc(nCrit) + "</strong> critical, " +
+          "<strong>" + esc(nWarn) + "</strong> warnings, <strong>" + esc(nInfo) +
           "</strong> improvements.</p>";
 
   if (findings.length) {
