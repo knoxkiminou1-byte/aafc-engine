@@ -20,12 +20,16 @@ import argparse
 import json
 import re
 import sys
+import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from html.parser import HTMLParser
 from urllib.parse import urljoin, urlparse, urldefrag, urlunparse
 
 import requests
+
+from aafc_engine.auditor import render as render_provider
 
 # Browser-like but honest UA: some sites/WAFs block unknown bot UAs outright,
 # which used to produce false "site did not respond" failures. We identify the
@@ -230,6 +234,52 @@ class PageParser(HTMLParser):
 # ----------------------------------------------------------------------------
 # Fetching
 # ----------------------------------------------------------------------------
+
+# Optional fetch guard: callable(url) -> None, raising ValueError for a URL
+# that must not be fetched. When set, it is enforced for the initial URL
+# and for EVERY redirect target (requests follows redirects automatically,
+# so checking only the initial host would leave an SSRF hole: a public URL
+# 302-redirecting to a private/internal address). The hosted API enforces
+# this around its engine call via ``fetch_guard()``; the CLI never sets it
+# so local/private targets (localhost fixtures, intranet audits) keep
+# working. Never set module-globally at import time: that would leak the
+# guard into every importer of the engine (including the test suite).
+FETCH_GUARD = None
+
+_GUARD_LOCK = threading.Lock()
+_GUARD_DEPTH = 0
+
+
+@contextmanager
+def fetch_guard(fn):
+    """Enforce ``fn`` as the fetch guard for the enclosed engine calls.
+
+    Reentrancy-safe: the guard stays active until the outermost context
+    exits, so concurrent hosted audits cannot unset it under each other.
+    """
+    global FETCH_GUARD, _GUARD_DEPTH
+    with _GUARD_LOCK:
+        _GUARD_DEPTH += 1
+        FETCH_GUARD = fn
+    try:
+        yield
+    finally:
+        with _GUARD_LOCK:
+            _GUARD_DEPTH -= 1
+            if _GUARD_DEPTH == 0:
+                FETCH_GUARD = None
+
+
+def _guard_response_hook(response, *args, **kwargs):
+    """requests response hook: veto redirect targets via FETCH_GUARD."""
+    if FETCH_GUARD is not None and response.is_redirect:
+        location = response.headers.get("location")
+        if location:
+            from urllib.parse import urljoin
+
+            FETCH_GUARD(urljoin(response.url, location))  # raises ValueError
+
+
 def fetch(url, method="GET", _retried=False):
     """Fetch a URL. Returns dict with status, final_url, headers, text, elapsed, error.
 
@@ -241,6 +291,17 @@ def fetch(url, method="GET", _retried=False):
     started = time.time()
     session = requests.Session()
     session.max_redirects = MAX_REDIRECTS
+    if FETCH_GUARD is not None:
+        try:
+            FETCH_GUARD(url)
+        except ValueError as e:
+            return {
+                "ok": False, "status": None, "final_url": url, "headers": {},
+                "text": "", "bytes": 0, "elapsed": round(time.time() - started, 2),
+                "redirects": 0, "redirect_chain": [],
+                "error": f"Blocked: {e}",
+            }
+        session.hooks["response"].append(_guard_response_hook)
     try:
         r = session.request(method, url, headers=UA, timeout=TIMEOUT,
                             allow_redirects=True)
@@ -253,6 +314,14 @@ def fetch(url, method="GET", _retried=False):
             "bytes": len(r.content), "elapsed": round(elapsed, 2),
             "redirects": len(r.history), "redirect_chain": chain,
             "error": None,
+        }
+    except ValueError as e:
+        # FETCH_GUARD rejection of a redirect target (raised from the hook).
+        return {
+            "ok": False, "status": None, "final_url": url, "headers": {},
+            "text": "", "bytes": 0, "elapsed": round(time.time() - started, 2),
+            "redirects": 0, "redirect_chain": [],
+            "error": f"Blocked: {e}",
         }
     except requests.RequestException as e:
         if not _retried and isinstance(
@@ -322,7 +391,7 @@ def visible_text_length(html):
 
 
 def F(page, check, severity, title, evidence, why, fix, technical="",
-      review_hint=False):
+      review_hint=False, verification="HTTP_FETCH"):
     # FIX 7: review_hint may be the string "rendered" — the repo layer maps
     # that to the NEEDS_RENDERED_REVIEW confidence (raw HTML contradicts what
     # a browser shows; a rendered-DOM check is required before asserting).
@@ -332,10 +401,11 @@ def F(page, check, severity, title, evidence, why, fix, technical="",
         "technical": technical,
         # FIX 5: every finding says which page it came from and what kind.
         "page_kind": page_kind(page),
-        # FIX 6: how this finding was verified. HTTP_FETCH = measured from a
-        # plain HTTP fetch. NEEDS_RENDERED_DOM would require a real browser;
-        # the engine never claims browser verification it did not perform.
-        "verification": "HTTP_FETCH",
+        # FIX 6 / RENDER: how this finding was verified. HTTP_FETCH = measured
+        # from a plain HTTP fetch. RENDERED_DOM = confirmed in the engine's
+        # own headless Chromium. The engine never claims browser evidence it
+        # did not perform.
+        "verification": verification,
         # When True, the repo layer downgrades confidence to NEEDS MANUAL
         # REVIEW (page looked JS-rendered; the static HTML said nothing).
         # When "rendered", downgrades to NEEDS_RENDERED_REVIEW instead.
@@ -343,7 +413,225 @@ def F(page, check, severity, title, evidence, why, fix, technical="",
     }
 
 
-def check_page(url, res, parser):
+# ---------------------------------------------------------------------------
+# DOM-sensitive checks — one implementation, two evidence sources.
+#
+# These checks (title, meta description, h1, images, canonical) depend on
+# the DOM, so they run against EITHER the raw-HTML parse OR the rendered DOM
+# from the engine's own headless Chromium. Rendered evidence outranks raw
+# HTML: see _reconcile_dom_findings.
+# ---------------------------------------------------------------------------
+DOM_CHECK_NAMES = ("title", "meta_description", "h1", "img_alt", "canonical")
+
+
+def _dom_from_parser(url, parser):
+    """Build the DOM-check input shape from the raw-HTML parser.
+
+    Applies the FIX 7 image filtering (excludes non-rendered markup,
+    data URIs, tracking pixels; dedupes by resolved src) so raw counts
+    are as honest as possible before any rendered comparison.
+    """
+    def _img_usable(img):
+        if img.get("hidden") or img.get("in_noscript") or img.get("in_template"):
+            return False
+        src = (img.get("src") or "").strip()
+        if not src or src.lower().startswith("data:"):
+            return False
+        if str(img.get("width")).strip() == "1" and str(img.get("height")).strip() == "1":
+            return False  # tracking pixel
+        return True
+
+    seen_srcs, candidates = set(), []
+    for img in parser.images:
+        if not _img_usable(img):
+            continue
+        resolved = urljoin(url, img["src"].strip())
+        if resolved in seen_srcs:
+            continue
+        seen_srcs.add(resolved)
+        candidates.append(img)
+    return {
+        "title": (parser.title or "").strip(),
+        "description": parser.metas.get("description", "").strip(),
+        "canonical_count": parser.canonical_count,
+        "h1s": [t for lvl, t in parser.headings if lvl == 1],
+        "headings": list(parser.headings),
+        "images": candidates,
+    }
+
+
+def _dom_checks(url, dom, utility, rh, source, rich_page=False):
+    """Run the DOM-sensitive checks against one DOM state.
+
+    ``dom``: dict from _dom_from_parser or render.dom_from_rendered.
+    ``rh``: review_hint function (pass ``lambda c: False`` for rendered —
+    rendered DOM is ground truth, never a "hint").
+    ``source``: "http" | "rendered" — sets the verification label.
+    ``rich_page``: HTTP-only; whether the page has substantial visible text
+    (drives the FIX 7 raw-HTML-vs-rendered disagreement rule).
+    """
+    verification = "RENDERED_DOM" if source == "rendered" else "HTTP_FETCH"
+    findings = []
+    title = dom["title"]
+    desc = dom["description"]
+
+    # -- title -----------------------------------------------------------
+    # FIX 3: utility pages don't need marketing metadata. Missing title on a
+    # utility page is info at most; title-length nits are suppressed there.
+    if not title:
+        findings.append(F(url, "title", "critical" if not utility else "info",
+            "Page has no <title>",
+            "No <title> tag found in <head>.",
+            "The title is what shows as the blue link in Google and the tab label. Without it, search listings look broken and click-through drops.",
+            "Add a unique, descriptive <title> (50–60 characters) to every page.",
+            technical="title tag missing/empty",
+            review_hint=rh("title"), verification=verification))
+    elif (len(title) < 30 or len(title) > 60) and not utility:
+        findings.append(F(url, "title", "warning",
+            f"Title length is {len(title)} characters (recommended 30–60)",
+            f'Title: "{title}"',
+            "Titles that are too short waste the listing; titles that are too long get cut off in Google.",
+            "Rewrite the title to 30–60 characters, most important words first.",
+            technical=f"title_len={len(title)}",
+            review_hint=rh("title"), verification=verification))
+
+    # -- meta description --------------------------------------------------
+    # FIX 3: missing meta description on a utility page is not a finding —
+    # nobody searches for a cart page.
+    if not desc and not utility:
+        findings.append(F(url, "meta_description", "warning",
+            "Missing meta description",
+            "No <meta name=\"description\"> found.",
+            "Google writes its own snippet for the listing, which usually converts worse than a hand-written one.",
+            "Add a 120–155 character meta description that sells the click.",
+            technical="meta description missing",
+            review_hint=rh("meta_description"), verification=verification))
+    elif desc and (len(desc) < 70 or len(desc) > 160) and not utility:
+        findings.append(F(url, "meta_description", "info",
+            f"Meta description is {len(desc)} characters (recommended 70–160)",
+            f'Description: "{desc[:120]}…"',
+            "Odd-length descriptions get truncated or underused in search results.",
+            "Tighten the description to 120–155 characters.",
+            technical=f"desc_len={len(desc)}",
+            review_hint=rh("meta_description"), verification=verification))
+
+    # -- h1 ----------------------------------------------------------------
+    h1s = dom["h1s"]
+    if not h1s:
+        findings.append(F(url, "h1", "warning", "Page has no H1 heading",
+            f"{len(dom['headings'])} headings found, none at level 1.",
+            "The H1 tells Google and screen readers what the page is about. Missing it weakens both SEO and accessibility.",
+            "Add exactly one H1 per page that states the page's topic.",
+            technical=f"headings={len(dom['headings'])}, h1=0",
+            review_hint=rh("h1"), verification=verification))
+    elif len(h1s) > 1:
+        findings.append(F(url, "h1", "warning", f"Page has {len(h1s)} H1 headings (recommended: 1)",
+            f"H1s: {h1s[:3]}",
+            "Multiple H1s dilute the page's topic signal for search engines and confuse screen-reader users.",
+            "Keep one H1 per page; demote the rest to H2.",
+            technical=f"h1_count={len(h1s)}",
+            review_hint=rh("h1"), verification=verification))
+
+    # -- images ------------------------------------------------------------
+    # FIX 7: raw <img> counts lie (hidden/duplicate markup inflates them).
+    # With rendered DOM we assert on what actually renders; with raw HTML we
+    # apply the disagreement rule instead of asserting.
+    #
+    # Accuracy rule: a MISSING alt attribute is a genuine defect signal. An
+    # explicitly empty alt="" marks a decorative image per WCAG — that is
+    # correct authoring and must NEVER lower the score. Decorative images
+    # are reported as unscored info so the owner can verify the marking is
+    # intentional.
+    candidates = dom["images"]
+    missing = [i for i in candidates if i.get("alt") is None]
+    decorative = [i for i in candidates
+                  if i.get("alt") is not None and not i.get("alt").strip()]
+    if candidates and missing:
+        ratio = len(missing) / len(candidates)
+        examples = ", ".join((i.get("src") or "")[:60] for i in missing[:3])
+        if source == "rendered":
+            sev = "warning" if ratio >= 0.3 else "info"
+            findings.append(F(url, "img_alt", sev,
+                f"{len(missing)} of {len(candidates)} rendered images missing alt text",
+                f"Examples: {examples}",
+                "Screen-reader users hear 'image' with no description, and Google can't understand image content — both hurt accessibility scores and image search traffic.",
+                "Add short, descriptive alt text to every meaningful image (leave decorative images with empty alt=\"\").",
+                technical=f"missing_alt_rendered={len(missing)}/{len(candidates)}",
+                verification=verification))
+        elif ratio >= 0.5 and rich_page:
+            # Looks like the franklin case: raw HTML disagrees with what a
+            # browser renders. Assert nothing; send to rendered review.
+            findings.append(F(url, "img_alt", "warning",
+                f"{len(missing)} of {len(candidates)} images missing alt text in raw HTML — needs rendered-DOM check",
+                f"Examples: {examples}",
+                "The raw HTML suggests many images lack descriptions, but the rendered page may differ (hidden/duplicate markup inflates raw counts). Screen readers and Google can only use what actually renders.",
+                "Verify alt text in a real browser (rendered DOM), then add descriptive alt text to meaningful images that truly lack it.",
+                technical=f"missing_alt_raw={len(missing)}/{len(candidates)}; rendered check required",
+                review_hint="rendered", verification=verification))
+        else:
+            sev = "warning" if ratio >= 0.3 else "info"
+            findings.append(F(url, "img_alt", sev,
+                f"{len(missing)} of {len(candidates)} images missing alt text",
+                f"Examples: {examples}",
+                "Screen-reader users hear 'image' with no description, and Google can't understand image content — both hurt accessibility scores and image search traffic.",
+                "Add short, descriptive alt text to every meaningful image (leave decorative images with empty alt=\"\").",
+                technical=f"missing_alt={len(missing)}/{len(candidates)} (rendered candidates, deduped)",
+                review_hint=rh("img_alt"), verification=verification))
+    if decorative:
+        dec_examples = ", ".join(
+            (i.get("src") or "")[:60] for i in decorative[:3])
+        findings.append(F(url, "img_alt", "info",
+            f"{len(decorative)} image(s) marked decorative (empty alt) — not scored",
+            f"Examples: {dec_examples}",
+            "Empty alt text is the correct way to mark decorative images for screen readers; these do not affect the score.",
+            "Verify these images are truly decorative. If any conveys meaning, give it descriptive alt text.",
+            technical=f"decorative_alt={len(decorative)}/{len(candidates)}",
+            verification=verification))
+
+    # -- canonical -----------------------------------------------------------
+    # FIX 3: a utility page needs no canonical — suppress the missing-canonical
+    # nit there, but still warn on multiple conflicting canonicals.
+    if dom["canonical_count"] == 0 and not utility:
+        findings.append(F(url, "canonical", "warning", "No canonical URL set",
+            "No <link rel=\"canonical\"> found.",
+            "Without a canonical, duplicate or similar pages can split ranking power in Google.",
+            "Add a canonical link pointing to the page's preferred URL.",
+            technical="canonical missing",
+            review_hint=rh("canonical"), verification=verification))
+    elif dom["canonical_count"] > 1:
+        findings.append(F(url, "canonical", "warning", "Multiple canonical tags",
+            f"{dom['canonical_count']} canonical tags found.",
+            "Search engines may ignore conflicting canonical signals.",
+            "Keep exactly one canonical tag per page.",
+            technical=f"canonical_count={dom['canonical_count']}",
+            review_hint=rh("canonical"), verification=verification))
+    return findings
+
+
+def _reconcile_dom_findings(http_findings, rendered_findings):
+    """Rendered DOM outranks raw HTML, per check.
+
+    For each DOM-sensitive check: if the rendered pass produced findings,
+    those win (ground truth). If it produced none, the HTTP finding is
+    contradicted and dropped. Findings for other checks pass through.
+    """
+    rendered_by_check = {}
+    for f in rendered_findings:
+        rendered_by_check.setdefault(f["check"], []).append(f)
+    out = [f for f in http_findings if f["check"] not in DOM_CHECK_NAMES]
+    for name in DOM_CHECK_NAMES:
+        out.extend(rendered_by_check.get(name, []))
+    return out
+
+
+def check_page(url, res, parser, rendered=None):
+    """Check one fetched page.
+
+    ``rendered``: optional rendered-DOM state dict from
+    :mod:`aafc_engine.auditor.render` (or None for HTTP-only mode). When
+    provided, the DOM-sensitive checks run against the rendered DOM and it
+    outranks the raw-HTML parse (see _reconcile_dom_findings).
+    """
     findings = []
     stats = {
         "url": url, "status": res["status"], "final_url": res["final_url"],
@@ -402,46 +690,21 @@ def check_page(url, res, parser):
             "Remove noindex from the X-Robots-Tag header for public pages.",
             technical="X-Robots-Tag contains noindex"))
 
-    # -- metadata ----------------------------------------------------------
-    # FIX 3: utility pages don't need marketing metadata. Missing title on a
-    # utility page is info at most; title-length nits are suppressed there.
-    title = (parser.title or "").strip()
-    if not title:
-        findings.append(F(url, "title", "critical" if not utility else "info",
-            "Page has no <title>",
-            "No <title> tag found in <head>.",
-            "The title is what shows as the blue link in Google and the tab label. Without it, search listings look broken and click-through drops.",
-            "Add a unique, descriptive <title> (50–60 characters) to every page.",
-            technical="title tag missing/empty",
-            review_hint=rh("title")))
-    elif (len(title) < 30 or len(title) > 60) and not utility:
-        findings.append(F(url, "title", "warning",
-            f"Title length is {len(title)} characters (recommended 30–60)",
-            f'Title: "{title}"',
-            "Titles that are too short waste the listing; titles that are too long get cut off in Google.",
-            "Rewrite the title to 30–60 characters, most important words first.",
-            technical=f"title_len={len(title)}",
-            review_hint=rh("title")))
-
-    # FIX 3: missing meta description on a utility page is not a finding —
-    # nobody searches for a cart page.
-    desc = parser.metas.get("description", "").strip()
-    if not desc and not utility:
-        findings.append(F(url, "meta_description", "warning",
-            "Missing meta description",
-            "No <meta name=\"description\"> found.",
-            "Google writes its own snippet for the listing, which usually converts worse than a hand-written one.",
-            "Add a 120–155 character meta description that sells the click.",
-            technical="meta description missing",
-            review_hint=rh("meta_description")))
-    elif desc and (len(desc) < 70 or len(desc) > 160) and not utility:
-        findings.append(F(url, "meta_description", "info",
-            f"Meta description is {len(desc)} characters (recommended 70–160)",
-            f'Description: "{desc[:120]}…"',
-            "Odd-length descriptions get truncated or underused in search results.",
-            "Tighten the description to 120–155 characters.",
-            technical=f"desc_len={len(desc)}",
-            review_hint=rh("meta_description")))
+    # -- DOM-sensitive checks (title, meta description, h1, images, canonical)
+    # run against the raw-HTML parse AND, when available, the rendered DOM.
+    # Rendered evidence outranks raw HTML (see _reconcile_dom_findings).
+    rich_page = visible_text_length(res.get("text", "")) >= 1000
+    http_dom = _dom_from_parser(url, parser)
+    http_dom_findings = _dom_checks(url, http_dom, utility, rh, "http",
+                                   rich_page=rich_page)
+    if rendered is not None:
+        rendered_dom = render_provider.dom_from_rendered(url, rendered)
+        rendered_dom_findings = _dom_checks(url, rendered_dom, utility,
+                                            lambda c: False, "rendered")
+        findings.extend(
+            _reconcile_dom_findings(http_dom_findings, rendered_dom_findings))
+    else:
+        findings.extend(http_dom_findings)
 
     if "viewport" not in parser.metas:
         findings.append(F(url, "viewport", "critical", "No viewport meta tag",
@@ -458,21 +721,7 @@ def check_page(url, res, parser):
             technical="charset undeclared"))
 
     # -- headings ----------------------------------------------------------
-    h1s = [t for lvl, t in parser.headings if lvl == 1]
-    if not h1s:
-        findings.append(F(url, "h1", "warning", "Page has no H1 heading",
-            f"{len(parser.headings)} headings found, none at level 1.",
-            "The H1 tells Google and screen readers what the page is about. Missing it weakens both SEO and accessibility.",
-            "Add exactly one H1 per page that states the page's topic.",
-            technical=f"headings={len(parser.headings)}, h1=0",
-            review_hint=rh("h1")))
-    elif len(h1s) > 1:
-        findings.append(F(url, "h1", "warning", f"Page has {len(h1s)} H1 headings (recommended: 1)",
-            f"H1s: {h1s[:3]}",
-            "Multiple H1s dilute the page's topic signal for search engines and confuse screen-reader users.",
-            "Keep one H1 per page; demote the rest to H2.",
-            technical=f"h1_count={len(h1s)}",
-            review_hint=rh("h1")))
+    # (h1 itself is a DOM-sensitive check — handled in _dom_checks above.)
     levels = [lvl for lvl, _ in parser.headings]
     skips = [f"h{levels[i]}→h{levels[i+1]}" for i in range(len(levels) - 1)
              if levels[i + 1] > levels[i] + 1]
@@ -486,75 +735,10 @@ def check_page(url, res, parser):
             review_hint=rh("heading_order")))
 
     # -- images ------------------------------------------------------------
-    # FIX 7: raw <img> counts lie. The parser now tags images that never
-    # render (hidden containers, noscript/template) so we exclude them, drop
-    # data-URI and 1x1 tracking pixels, and dedupe by resolved src. Browser
-    # ground truth (franklinbbq.com): raw HTML showed 48 imgs / 46 empty alt
-    # while the rendered page had ~28 images with descriptive alts. So when a
-    # large share of the *rendered-candidate* images have empty alt on an
-    # otherwise content-rich page, we do NOT assert "N of M missing" — we
-    # flag NEEDS_RENDERED_REVIEW (warning) for a real browser check.
-    def _img_usable(img):
-        if img.get("hidden") or img.get("in_noscript") or img.get("in_template"):
-            return False
-        src = (img.get("src") or "").strip()
-        if not src or src.lower().startswith("data:"):
-            return False
-        if str(img.get("width")).strip() == "1" and str(img.get("height")).strip() == "1":
-            return False  # tracking pixel
-        return True
-
-    seen_srcs, candidates = set(), []
-    for img in parser.images:
-        if not _img_usable(img):
-            continue
-        resolved = urljoin(url, img["src"].strip())
-        if resolved in seen_srcs:
-            continue
-        seen_srcs.add(resolved)
-        candidates.append(img)
-    no_alt = [i for i in candidates if not (i["alt"] or "").strip()]
-    if candidates and no_alt:
-        ratio = len(no_alt) / len(candidates)
-        examples = ", ".join((i["src"] or "")[:60] for i in no_alt[:3])
-        rich_page = visible_text_length(res.get("text", "")) >= 1000
-        if ratio >= 0.5 and rich_page:
-            # Looks like the franklin case: raw HTML disagrees with what a
-            # browser renders. Assert nothing; send to rendered review.
-            findings.append(F(url, "img_alt", "warning",
-                f"{len(no_alt)} of {len(candidates)} images have empty alt text in raw HTML — needs rendered-DOM check",
-                f"Examples: {examples}",
-                "The raw HTML suggests many images lack descriptions, but the rendered page may differ (hidden/duplicate markup inflates raw counts). Screen readers and Google can only use what actually renders.",
-                "Verify alt text in a real browser (rendered DOM), then add descriptive alt text to meaningful images that truly lack it.",
-                technical=f"empty_alt_raw={len(no_alt)}/{len(candidates)}; rendered check required",
-                review_hint="rendered"))
-        else:
-            sev = "warning" if ratio >= 0.3 else "info"
-            findings.append(F(url, "img_alt", sev,
-                f"{len(no_alt)} of {len(candidates)} images missing alt text",
-                f"Examples: {examples}",
-                "Screen-reader users hear 'image' with no description, and Google can't understand image content — both hurt accessibility scores and image search traffic.",
-                "Add short, descriptive alt text to every meaningful image (leave decorative images with empty alt=\"\").",
-                technical=f"missing_alt={len(no_alt)}/{len(candidates)} (rendered candidates, deduped)",
-                review_hint=rh("img_alt")))
+    # (img_alt is a DOM-sensitive check — handled in _dom_checks above.)
 
     # -- links / canonical / social ---------------------------------------
-    # FIX 3: a utility page needs no canonical — suppress the missing-canonical
-    # nit there, but still warn on multiple conflicting canonicals.
-    if parser.canonical_count == 0 and not utility:
-        findings.append(F(url, "canonical", "warning", "No canonical URL set",
-            "No <link rel=\"canonical\"> found.",
-            "Without a canonical, duplicate or similar pages can split ranking power in Google.",
-            "Add a canonical link pointing to the page's preferred URL.",
-            technical="canonical missing",
-            review_hint=rh("canonical")))
-    elif parser.canonical_count > 1:
-        findings.append(F(url, "canonical", "warning", "Multiple canonical tags",
-            f"{parser.canonical_count} canonical tags found.",
-            "Search engines may ignore conflicting canonical signals.",
-            "Keep exactly one canonical tag per page.",
-            technical=f"canonical_count={parser.canonical_count}",
-            review_hint=rh("canonical")))
+    # (canonical is a DOM-sensitive check — handled in _dom_checks above.)
 
     for og in ("og:title", "og:description", "og:image"):
         if og not in parser.metas:
@@ -649,7 +833,7 @@ def check_page(url, res, parser):
         "forms": parser.forms,
         "scripts_external": len(parser.scripts),
         "json_ld_blocks": parser.json_ld,
-        "title": title,
+        "title": http_dom["title"],
     })
     return findings, stats
 
@@ -693,12 +877,24 @@ def check_robots_and_sitemap(base_url):
     return findings, info
 
 
-def check_broken_links(url, parser, cap=25):
-    """HEAD-check unique same-host links. Returns findings + stats."""
+def check_broken_links(url, parser, cap=25, rendered_links=None, time_left=None):
+    """HEAD-check unique same-host links. Returns findings + stats.
+
+    ``rendered_links``: optional [{href, text}] from the rendered DOM —
+    JS-injected links join the pool (deduped) when the renderer ran.
+    ``time_left``: optional callable returning seconds of audit budget
+    remaining (or None). When the budget is spent the loop stops early and
+    the finding honestly reports how many links were checked — a truncated
+    check never silently passes as a full one.
+    """
     seen = set()
     targets = []
-    for l in parser.links:
-        absu = clean_link(l["href"], url)
+    pool = []
+    if rendered_links:
+        pool.extend((l.get("href"), l.get("text", "")) for l in rendered_links)
+    pool.extend((l["href"], l["text"]) for l in parser.links)
+    for href, _text in pool:
+        absu = clean_link(href, url)
         if absu and same_host(absu, url) and absu not in seen:
             seen.add(absu)
             targets.append(absu)
@@ -707,6 +903,8 @@ def check_broken_links(url, parser, cap=25):
     broken = []
     checked = 0
     for t in targets:
+        if time_left is not None and time_left() is not None and time_left() <= 0:
+            break
         r = fetch(t, method="HEAD")
         checked += 1
         if not r["ok"] or (r["status"] and r["status"] >= 400):
@@ -730,16 +928,38 @@ def check_broken_links(url, parser, cap=25):
 # ----------------------------------------------------------------------------
 # Crawl + score
 # ----------------------------------------------------------------------------
-def audit_site(start_url, max_pages=6):
+def audit_site(start_url, max_pages=6, render=True, time_budget=None):
+    """Audit a site: HTTP crawl + checks, optionally with rendered-DOM verification.
+
+    ``render``: when True (default) and the render provider is available
+    (Playwright + Chromium installed), each crawled page is also loaded in
+    the engine's own headless Chromium and the DOM-sensitive checks run
+    against the rendered DOM, which outranks the raw-HTML parse. When the
+    provider is unavailable the engine runs HTTP-only exactly as before —
+    pass ``render=False`` to force HTTP-only mode (e.g. the Vercel hosted
+    path, where no browser ships).
+
+    ``time_budget``: optional wall-clock budget in seconds (used by the
+    hosted quick-audit path). When the budget is exceeded mid-run the audit
+    stops and returns ``status="PARTIAL"`` with whatever completed — no
+    fake full grade is produced.
+    """
     started_all = time.time()
+
+    def _budget_left():
+        return None if time_budget is None else time_budget - (time.time() - started_all)
+
+    def _budget_hit():
+        left = _budget_left()
+        return left is not None and left <= 0
     if not urlparse(start_url).scheme:
         start_url = "https://" + start_url
     start_url = norm_url(start_url)
     findings, page_stats = [], []
     seen, queue = set(), [start_url]
-    crawled = 0
+    crawled_pages = []  # (url, res, parser) in crawl order; checked after render
 
-    while queue and crawled < max_pages:
+    while queue and len(crawled_pages) < max_pages and not _budget_hit():
         url = queue.pop(0)
         if url in seen:
             continue
@@ -761,6 +981,13 @@ def audit_site(start_url, max_pages=6):
                 technical=f"status={res['status']}"))
             continue
         ctype = res["headers"].get("Content-Type", "")
+        if not ctype:
+            # HTTP header names are case-insensitive; some servers send
+            # "content-type" or "Content-type".
+            ctype = next(
+                (v for k, v in res["headers"].items() if k.lower() == "content-type"),
+                "",
+            )
         if "html" not in ctype.lower():
             continue
         parser = PageParser()
@@ -770,19 +997,71 @@ def audit_site(start_url, max_pages=6):
             findings.append(F(url, "parse", "info", "Page HTML could not be fully parsed",
                 f"Parser error: {e}", "Some checks may be incomplete for this page.",
                 "Validate the page HTML.", technical=str(e)))
-        pf, stats = check_page(url, res, parser)
-        findings.extend(pf)
-        # broken-link check only on the homepage (cost control)
-        if crawled == 0:
-            bf, bstats = check_broken_links(url, parser)
-            findings.extend(bf)
-            stats.update(bstats)
-        page_stats.append(stats)
-        crawled += 1
+        crawled_pages.append((url, res, parser))
         for l in parser.links:
             absu = clean_link(l["href"], url)
             if absu and same_host(absu, start_url) and absu not in seen:
                 queue.append(absu)
+
+    crawled = len(crawled_pages)
+    budget_exceeded = _budget_hit()
+
+    # -- rendered-DOM pass -------------------------------------------------
+    # One shared headless Chromium for every crawled page. Rendered evidence
+    # outranks the raw-HTML parse in check_page. Any failure here degrades
+    # gracefully to HTTP-only (never kill the audit over the renderer).
+    # Skipped entirely when the time budget is already spent.
+    # The capability probe launches a real browser, so only run it when a
+    # rendered audit was actually requested.
+    render_available = render_provider.render_available() if render else False
+    rendered_map = {}
+    if render and render_available and crawled_pages and not budget_exceeded:
+        try:
+            # Bound the render phase by the remaining budget: reserve a few
+            # seconds for the check phase, slice the rest across pages, and
+            # hand the watchdog a hard total so the render phase itself can
+            # never blow the budget (serverless functions have hard limits).
+            render_timeout_ms = render_provider.GOTO_TIMEOUT_MS
+            render_total_s = None
+            left = _budget_left()
+            if left is not None and crawled_pages:
+                render_total_s = max(8.0, left - 5.0)
+                per_page_s = max(4.0, (render_total_s - 5.0) / len(crawled_pages))
+                render_timeout_ms = min(render_timeout_ms,
+                                        int(per_page_s * 1000))
+            rendered_map = render_provider.render_pages(
+                [u for u, _, _ in crawled_pages],
+                timeout_ms=render_timeout_ms,
+                total_timeout_s=render_total_s)
+        except Exception:
+            rendered_map = {}
+    render_used = bool(rendered_map)
+
+    for i, (url, res, parser) in enumerate(crawled_pages):
+        if _budget_hit():
+            budget_exceeded = True
+            break
+        pf, stats = check_page(
+            url, res, parser,
+            rendered=rendered_map.get(norm_url(url)))
+        findings.extend(pf)
+        # broken-link check only on the homepage (cost control); rendered
+        # links (JS-injected) join the pool when the renderer ran.
+        if i == 0:
+            rl = rendered_map.get(norm_url(url), {}).get("links")
+            bf, bstats = check_broken_links(
+                url, parser, rendered_links=rl, time_left=_budget_left)
+            findings.extend(bf)
+            stats.update(bstats)
+        page_stats.append(stats)
+
+    if budget_exceeded:
+        findings.append(F(start_url, "budget", "warning",
+            "Time budget exceeded — audit is PARTIAL",
+            f"The audit stopped after {time_budget}s with {len(page_stats)} of {crawled} crawled pages fully checked.",
+            "Partial results below cover only the pages that were fully checked; the grade is withheld because the audit did not finish.",
+            "Re-run the full audit from the CLI (aafc audit run) for the complete result.",
+            technical=f"time_budget={time_budget}s; pages_checked={len(page_stats)}/{crawled}"))
 
     rf, rinfo = check_robots_and_sitemap(start_url)
     findings.extend(rf)
@@ -818,6 +1097,12 @@ def audit_site(start_url, max_pages=6):
             "Nothing here was graded: the score below is absent, not zero. A site that doesn't load can't rank or convert — this is the first thing to fix.",
             "Restore reliable site loading, then re-run the audit for the full check.",
             technical="pages_crawled=0; no HTTP 200 page fetched"))
+    elif budget_exceeded:
+        # Honest partial: the budget ran out before the audit finished.
+        # The score below covers only the pages fully checked; the grade is
+        # withheld because presenting one would be a fake full grade.
+        status = "PARTIAL"
+        grade = None
     else:
         status = "COMPLETE"
         grade = "A" if score >= 90 else "B" if score >= 80 else "C" if score >= 65 else "D" if score >= 50 else "F"
@@ -837,6 +1122,21 @@ def audit_site(start_url, max_pages=6):
             "utility_page_findings_excluded_from_score": excluded_utility,
             "unverifiable_findings_excluded_from_score": excluded_unverifiable,
         },
+        # RENDER: how this audit verified its DOM-sensitive findings.
+        # mode is one of: "rendered" (headless Chromium ran and its DOM
+        # outranked raw HTML), "http_only_requested" (caller asked for no
+        # rendering, e.g. the hosted quick-audit path),
+        # "http_only_unavailable" (rendering requested but no usable
+        # Playwright/Chromium on this machine), or "render_degraded"
+        # (renderer present and requested, but no page rendered — every
+        # render failed or timed out — so findings are HTTP-only).
+        "render": {
+            "mode": ("rendered" if render_used
+                     else "http_only_requested" if not render
+                     else "http_only_unavailable" if not render_available
+                     else "render_degraded"),
+            "pages_rendered": len(rendered_map),
+        },
         "robots": rinfo,
         "pages": page_stats,
         "findings": findings,
@@ -846,6 +1146,14 @@ def audit_site(start_url, max_pages=6):
             "Broken-link check covers up to 25 same-host links on the homepage only.",
             "Findings from utility pages (cart, checkout, login, ...) are reported but excluded from the score.",
             "Findings the engine could not verify from raw HTML are reported as needing review, not scored.",
+        ] + ([
+            "Rendered-DOM verification ON: the engine's own headless Chromium rendered every crawled page and the rendered DOM outranked the raw HTML."
+        ] if render_used else [
+            "Rendered-DOM verification OFF (HTTP-only): DOM findings come from raw HTML. "
+            "Playwright/Chromium was not installed." if render and not render_available else
+            "Rendered-DOM verification OFF (HTTP-only): the renderer is installed but no page rendered (all renders failed or timed out)." if render else
+            "Rendered-DOM verification OFF (HTTP-only, as requested for this run)."
+        ]) + [
             "Checks are heuristic; a human review should confirm critical findings before client delivery.",
         ],
     }
@@ -870,8 +1178,14 @@ def render_client_report(site):
                  "problem first, then we'll run the full check.")
         L.append("")
     else:
-        L.append(f"## Overall score: {site['score']}/100 (Grade {site['grade']})")
-        L.append("")
+        if site.get("status") == "PARTIAL":
+            L.append(f"## Overall score so far: {site['score']}/100 (partial audit — grade withheld)")
+            L.append("")
+            L.append("_This audit hit its time budget before finishing, so the score covers only the pages that were fully checked. Run the full audit for a final grade._")
+            L.append("")
+        else:
+            L.append(f"## Overall score: {site['score']}/100 (Grade {site['grade']})")
+            L.append("")
     c = site["counts"]
     L.append(f"Found **{c['critical']} critical** issue(s), **{c['warning']}** warning(s), "
              f"and **{c['info']}** improvement(s) worth knowing about.")
@@ -934,7 +1248,8 @@ def render_technical_report(site):
                  f"critical={site['counts']['critical']} warning={site['counts']['warning']} "
                  f"info={site['counts']['info']}")
     else:
-        L.append(f"**Score {site['score']}/100 (Grade {site['grade']})** · "
+        grade_txt = f" (Grade {site['grade']})" if site.get("grade") else " (PARTIAL — grade withheld)"
+        L.append(f"**Score {site['score']}/100{grade_txt}** · "
                  f"critical={site['counts']['critical']} warning={site['counts']['warning']} "
                  f"info={site['counts']['info']}")
     L.append("")
@@ -989,7 +1304,8 @@ def main():
               f"critical={c['critical']} warning={c['warning']} info={c['info']} · "
               f"{site['pages_crawled']} pages in {site['elapsed_total']}s")
     else:
-        print(f"Score: {site['score']}/100 (Grade {site['grade']}) · "
+        status_txt = "PARTIAL — grade withheld" if site.get("status") == "PARTIAL" else f"Grade {site['grade']}"
+        print(f"Score: {site['score']}/100 ({status_txt}) · "
               f"critical={c['critical']} warning={c['warning']} info={c['info']} · "
               f"{site['pages_crawled']} pages in {site['elapsed_total']}s")
     print(f"Reports: {dest}/")

@@ -102,7 +102,12 @@ def _sitepulse_core(url: str, ctx: dict) -> list[dict]:
 
     Stores the raw site dict in ``ctx["site"]`` for other checks to reuse.
     """
-    site = engine.audit_site(url, max_pages=ctx["max_pages"])
+    site = engine.audit_site(
+        url,
+        max_pages=ctx["max_pages"],
+        render=ctx.get("render", True),
+        time_budget=ctx.get("time_budget"),
+    )
     ctx["site"] = site
     audit_id = ctx["audit_id"]
     website_id = ctx["website_id"]
@@ -118,12 +123,22 @@ def _sitepulse_core(url: str, ctx: dict) -> list[dict]:
     ]
 
 
-def run_audit(store: Any, client_id: str, website_id: str, max_pages: int = 6) -> dict:
+def run_audit(store: Any, client_id: str, website_id: str, max_pages: int = 6,
+              render: bool = True, time_budget: float | None = None) -> dict:
     """Run all registered checks against a website and save the audit.
 
     Loads the website via ``aafc_engine.websites`` and enforces
     authorization with ``require_authorized`` (raises ``NotAuthorizedError``
     when the website is not authorized -- the audit never runs without it).
+
+    ``render``: pass ``False`` to force HTTP-only mode (no headless
+    Chromium — e.g. the hosted serverless path). Defaults to True; when
+    the renderer is unavailable the engine degrades gracefully and says
+    so in the result.
+
+    ``time_budget``: optional wall-clock budget in seconds. When exceeded,
+    the audit stops and returns ``status="PARTIAL"`` with whatever
+    completed — no fake full grade.
 
     One bad check never kills the audit: a check that raises is recorded as
     an ERROR finding and the rest continue. Exception: if the built-in
@@ -146,6 +161,8 @@ def run_audit(store: Any, client_id: str, website_id: str, max_pages: int = 6) -
 
     ctx: dict = {
         "max_pages": max_pages,
+        "render": render,
+        "time_budget": time_budget,
         "site": None,
         "audit_id": audit_id,
         "website_id": website_id,
@@ -204,6 +221,8 @@ def run_audit(store: Any, client_id: str, website_id: str, max_pages: int = 6) -
         "findings": all_findings,
         "elapsed_total": site.get("elapsed_total", 0),
         "notes": notes,
+        # RENDER: how this audit's DOM findings were verified.
+        "render": site.get("render", {"mode": "unknown", "pages_rendered": 0}),
     }
     store.write_json(client_id, audit, "audits", f"{audit_id}.json")
     return audit

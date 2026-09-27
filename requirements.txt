@@ -1,3 +1,30 @@
-requests>=2.28
-pyyaml>=6
-pytest>=8
+# AAFC Engine — deploy (Vercel) runtime dependencies, FULLY PINNED LOCK.
+#
+# This is the lean serverless set: the hosted Quick Audit runs HTTP-only.
+# Playwright/Chromium is intentionally NOT here (it belongs in
+# requirements-local.txt for the local CLI rendered path) — the Vercel
+# Python function stays small and starts fast.
+#
+# Every direct AND transitive dependency is pinned to an exact version, so a
+# Vercel build today installs the same versions as a build months from now.
+# (Truly byte-identical installs would also need --require-hashes; versions
+# are pinned here, hashes are not.)
+# Source of truth for direct deps: requirements.in
+# Recompile with:  pip install -r requirements.in && pip freeze > requirements.txt
+#
+# Update rule: change a pin only alongside a tested change, and record the
+# reason in the commit message. Never leave an unpinned dependency here.
+
+blinker==1.9.0
+certifi==2026.7.22
+charset-normalizer==3.5.1
+click==8.5.0
+Flask==3.1.2
+idna==3.20
+itsdangerous==2.2.0
+Jinja2==3.1.6
+MarkupSafe==3.0.3
+PyYAML==6.0.3
+requests==2.34.2
+urllib3==2.8.0
+Werkzeug==3.1.8

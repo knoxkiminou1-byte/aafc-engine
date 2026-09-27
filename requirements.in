@@ -1,0 +1,7 @@
+# requirements.in — direct deploy dependencies (source of truth).
+# Compiled to requirements.txt with:  pip install -r requirements.in && pip freeze
+# Vercel installs requirements.txt (the full lock).
+
+flask==3.1.2
+requests==2.34.2
+pyyaml==6.0.3

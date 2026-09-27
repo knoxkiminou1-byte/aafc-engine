@@ -278,7 +278,7 @@ def test_15_failed_audit_blocked(store, acme_client, acme_site, monkeypatch):
     return pages_crawled=0 (the registry must never fake success -- and
     never a fake score/grade either).
     """
-    def fake_audit_site(url: str, max_pages: int = 6) -> dict:
+    def fake_audit_site(url: str, max_pages: int = 6, **kwargs) -> dict:
         return {
             "url": url,
             "status": "BLOCKED",

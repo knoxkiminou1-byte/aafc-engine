@@ -109,7 +109,7 @@ def stub_engine(monkeypatch) -> None:
     Severity mapping exercised: warning->HIGH (x2), critical->CRITICAL,
     info->LOW. Every finding carries non-empty evidence.
     """
-    def fake_audit_site(url: str, max_pages: int = 6) -> dict:
+    def fake_audit_site(url: str, max_pages: int = 6, **kwargs) -> dict:
         return {
             "url": url,
             "pages_crawled": 2,

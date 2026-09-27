@@ -168,7 +168,7 @@ def test_utility_findings_excluded_from_score(monkeypatch):
 
     monkeypatch.setattr(engine, "fetch", fake_fetch)
     monkeypatch.setattr(engine, "check_broken_links",
-                        lambda url, parser, cap=25: ([], {}))
+                        lambda url, parser, cap=25, **kwargs: ([], {}))
     site = audit_site("https://x.com/", max_pages=2)
     assert site["status"] == "COMPLETE"
     # the cart page's noindex produced no scored finding at all
@@ -215,16 +215,16 @@ FRANKLIN_LIKE_HTML = """<html><head><title>Franklin Barbecue</title>
 </head><body>
 <h1>SERVING THE BEST BARBECUE IN THE KNOWN UNIVERSE.</h1>
 <p>""" + "Real visible content. " * 200 + """</p>
-<img src="/img/brisket.jpg" alt="">
-<img src="/img/brisket.jpg" alt="">  <!-- duplicate of the above -->
+<img src="/img/brisket.jpg">
+<img src="/img/brisket.jpg">  <!-- duplicate of the above -->
 <div hidden><img src="/img/hidden1.jpg" alt=""><img src="/img/hidden2.jpg" alt=""></div>
 <div style="display:none"><img src="/img/hidden3.jpg" alt=""></div>
 <noscript><img src="/img/noscript.jpg" alt=""></noscript>
 <template><img src="/img/tpl.jpg" alt=""></template>
 <img src="data:image/gif;base64,R0lGODlhAQABAAAAACw=" alt="">
 <img src="/img/pixel.gif" width="1" height="1" alt="">
-<img src="/img/ribs.jpg" alt="">
-<img src="/img/sausage.jpg" alt="">
+<img src="/img/ribs.jpg">
+<img src="/img/sausage.jpg">
 </body></html>"""
 
 
@@ -262,12 +262,39 @@ def test_img_alt_converted_to_needs_rendered_review_confidence():
 def test_img_alt_sparse_page_keeps_plain_warning():
     # 300-999 visible chars: not a JS shell, not "rich" -> plain ratio warning
     html = ('<html><head><title>T</title></head><body><h1>T</h1>'
-            '<img src="/a.jpg" alt=""><img src="/b.jpg" alt="ok">'
+            '<img src="/a.jpg"><img src="/b.jpg" alt="ok">'
             '<p>' + "plain content. " * 40 + '</p></body></html>')
     found, _ = parse_and_check("https://x.com/", html)
     alt = [f for f in found if f["check"] == "img_alt"][0]
     assert not alt["review_hint"]
     assert "1 of 2 images missing alt text" in alt["title"]
+
+
+def test_img_alt_empty_alt_is_decorative_not_scored():
+    """Explicitly empty alt="" marks a decorative image (WCAG) — it must
+    never lower the score. Reported as unscored info only."""
+    html = ('<html><head><title>T</title></head><body><h1>T</h1>'
+            '<img src="/a.jpg" alt=""><img src="/b.jpg" alt="">'
+            '<p>' + "plain content. " * 40 + '</p></body></html>')
+    found, _ = parse_and_check("https://x.com/", html)
+    alt = [f for f in found if f["check"] == "img_alt"]
+    assert len(alt) == 1
+    assert alt[0]["severity"] == "info"
+    assert "not scored" in alt[0]["title"]
+    assert "decorative" in alt[0]["title"]
+    # info findings deduct nothing (score = 100 - 12*critical - 5*warning),
+    # so a page of correctly-marked decorative images keeps a clean score
+
+
+def test_img_alt_missing_vs_empty_distinction():
+    """One genuinely missing alt scores; the decorative one does not."""
+    html = ('<html><head><title>T</title></head><body><h1>T</h1>'
+            '<img src="/missing.jpg"><img src="/deco.jpg" alt="">'
+            '<p>' + "plain content. " * 40 + '</p></body></html>')
+    found, _ = parse_and_check("https://x.com/", html)
+    alt = {f["severity"]: f for f in found if f["check"] == "img_alt"}
+    assert "1 of 2 images missing alt text" in alt["warning"]["title"]
+    assert "not scored" in alt["info"]["title"]
 
 
 def test_review_hint_true_maps_to_needs_manual_review():

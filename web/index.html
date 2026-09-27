@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AAFC Website Health Check</title>
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<main class="wrap">
+  <header>
+    <h1>Website Health Check</h1>
+    <p class="sub">A quick, honest look at how your website is doing — powered by the AAFC audit engine.</p>
+    <p class="mode"><strong>Hosted Quick Audit:</strong> up to 3 pages · ~40&nbsp;second budget · HTTP-only.
+      For the full 6-page rendered audit, run the CLI (<code>aafc audit run</code>).</p>
+  </header>
+
+  <form id="audit-form">
+    <label for="url">Website URL</label>
+    <div class="row">
+      <input id="url" name="url" type="text" inputmode="url" autocomplete="url"
+             placeholder="https://example.com" required>
+      <button type="submit" id="go">Run audit</button>
+    </div>
+    <p class="hint">Public websites only. Nothing is stored — the report is generated fresh each run.</p>
+  </form>
+
+  <section id="status" class="hidden" aria-live="polite"></section>
+  <section id="report" class="hidden"></section>
+</main>
+<script src="/app.js"></script>
+</body>
+</html>

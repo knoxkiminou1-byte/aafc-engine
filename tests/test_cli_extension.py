@@ -137,7 +137,7 @@ def test_opportunities_command(capsys, argv_data, monkeypatch):
         store, client["id"], "https://example.com", authorized=True
     )
 
-    def fake_audit_site(url, max_pages=6):
+    def fake_audit_site(url, max_pages=6, **kwargs):
         return {
             "url": url, "pages_crawled": 1, "score": 70, "grade": "C",
             "counts": {"critical": 0, "warning": 1, "info": 0},

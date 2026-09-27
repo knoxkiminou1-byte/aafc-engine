@@ -51,10 +51,23 @@ having permission to inspect are separate things.
 
 ```bash
 ./aafc checks list
+./aafc checks capabilities          # renderer availability + runtime report
 ./aafc audit run --client <id> --website <id> [--pages 6]
+./aafc audit run --client <id> --website <id> --no-render   # force HTTP-only
 ./aafc audit-full --email jane@acmebakery.test   # website + social + cross-channel
 ./aafc footprint --email jane@acmebakery.test    # public digital-footprint discovery
 ```
+
+`audit run` renders with the local headless Chromium by default (when
+Playwright + Chromium are installed); `--no-render` forces HTTP-only mode.
+
+## Hosted Quick Audit (Vercel)
+
+`web/` + `api/index.py` is a minimal static frontend and a Vercel Python
+serverless API that drive the **real** engine — no mocks. Hosted mode is an
+explicitly labeled Quick Audit: max 3 pages, ~40s budget, HTTP-only, with
+`status: PARTIAL` (grade withheld) on budget overrun. Full deploy steps and
+limits: [`DEPLOY.md`](DEPLOY.md).
 
 The audit crawls up to N pages (default 6), runs every registered check, and
 saves a versioned, immutable audit (`version` 1, 2, 3… per website — old
@@ -199,6 +212,14 @@ delivery + delivery log, 7 email templates, full CLI, 45-test suite.
   followed, connection errors retried once.
 - Raw-HTML parsing of metadata, headings, images, links, forms, and
   noindex/canonical directives — all labeled `verification: HTTP_FETCH`.
+- **Rendered-DOM verification (local):** when Playwright + Chromium are
+  installed, `aafc audit run` (default `--render`) also loads every crawled
+  page in the engine's own headless Chromium. The DOM-sensitive checks
+  (title, meta description, H1, images, canonical) run against the rendered
+  DOM, which **outranks** the raw HTML: rendered-confirmed findings are
+  labeled `verification: RENDERED_DOM`; findings the rendered DOM
+  contradicts are dropped. Without the renderer the engine runs HTTP-only
+  and says so honestly (`aafc checks capabilities`).
 - Utility-page awareness: `cart`, `checkout`, `login`, `account`, etc. are
   classified `page_kind: utility`; expected utility behavior (e.g. cart
   `noindex`) is never scored as a failure, and utility findings are excluded
@@ -206,31 +227,37 @@ delivery + delivery log, 7 email templates, full CLI, 45-test suite.
 - Unreachable sites return `status: BLOCKED` with **no score and no grade**.
 - Image-alt counts exclude non-rendered images (hidden containers,
   `<noscript>`/`<template>`, tracking pixels, data URIs) and duplicates by
-  resolved `src`. When raw HTML strongly suggests missing alts on a
-  content-rich page but the rendered page may differ, the finding is marked
-  `NEEDS_RENDERED_REVIEW` (warning) instead of asserting a count.
+  resolved `src`. A **missing** `alt` attribute is scored as a defect; an
+  explicitly empty `alt=""` marks a decorative image per WCAG — that is
+  correct authoring, is reported as unscored info only, and never lowers
+  the score. With rendered DOM available, missing alt is asserted on what
+  actually renders; in HTTP-only mode a strong raw-HTML missing-alt signal
+  on a content-rich page is marked `NEEDS_RENDERED_REVIEW` (warning, not
+  scored) instead of asserting a count.
 
 **LIMITATIONS (what it does not do):**
 
-- The auditor **cannot see what a browser sees**. Findings come from static
-  HTML only — no JavaScript executes, no CSS applies, nothing renders.
-- Near-empty static shells (JS-rendered pages) are flagged
-  `NEEDS MANUAL REVIEW` rather than reported as ordinary failures.
-- `NEEDS_RENDERED_REVIEW` findings require a real rendered-DOM check before
-  they can be quoted as fact.
+- In **HTTP-only mode** (e.g. the hosted Quick Audit, or no Chromium
+  installed) the auditor cannot see what a browser sees — findings come
+  from static HTML only. Near-empty static shells (JS-rendered pages) are
+  flagged `NEEDS MANUAL REVIEW` rather than reported as ordinary failures,
+  and `NEEDS_RENDERED_REVIEW` findings require a rendered-DOM check before
+  they can be quoted as fact. The result always states which mode ran.
+- The hosted Quick Audit (`web/` + `api/index.py`, see `DEPLOY.md`) is
+  capped at 3 pages / ~40 seconds / HTTP-only, and returns
+  `status: PARTIAL` (grade withheld) when the budget is exceeded.
 
-**PLANNED (not implemented):** an actual Chromium/browser-rendered audit
-mode that would verify `NEEDS_RENDERED_REVIEW` findings against the real
-rendered DOM. Until it exists, **never claim browser verification** — not
-from curl, not from `requests`, not from fetched page source.
+**NEVER claim browser verification** from curl, `requests`, or fetched page
+source — only from a run whose result says `render.mode == "rendered"`.
 
 **EXPERIMENTAL:** footprint/social discovery (public homepage links only; no
 search API, so Google Business/directories report NOT FOUND honestly; major
 social platforms usually bot-block fetches → honest ERROR findings).
 
-**PLANNED (not built):** Postgres migration path, hosted deployment,
-per-client report URLs, real re-audit scheduling.
+**PLANNED (not built):** Postgres migration path,
+per-client report URLs, real re-audit scheduling. (Hosted deployment: built —
+see `DEPLOY.md`.)
 
 **BLOCKED:** SwiftSend provider (no API exists; needs base URL + auth +
-endpoint contract). Live Vercel/production changes (Amaury's read-only
-boundary — authorization required).
+endpoint contract). Live Vercel/production changes beyond the AAFC Engine
+project itself (Amaury's standing boundary — authorization required).

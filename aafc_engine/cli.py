@@ -147,12 +147,14 @@ def cmd_website_authorize(args: argparse.Namespace, store: Store) -> tuple[dict,
 def cmd_audit_run(args: argparse.Namespace, store: Store) -> tuple[dict, str]:
     """Run the audit on an authorized website."""
     audit = audit_registry.run_audit(
-        store, args.client, args.website, max_pages=args.pages
+        store, args.client, args.website, max_pages=args.pages,
+        render=args.render,
     )
     return {"audit": audit}, (
         f"Audit {audit['id']}: status={audit['status']} "
         f"score={audit.get('score')} grade={audit.get('grade')} "
-        f"pages={audit.get('pages_crawled')}"
+        f"pages={audit.get('pages_crawled')} "
+        f"render_mode={audit.get('render', {}).get('mode', 'unknown')}"
     )
 
 
@@ -185,6 +187,30 @@ def cmd_checks_list(args: argparse.Namespace, store: Store) -> tuple[dict, str]:
     return {"checks": names}, (
         "Checks:\n" + "\n".join(f"  - {n}" for n in names)
         if names else "No checks registered."
+    )
+
+
+def cmd_checks_capabilities(args: argparse.Namespace, store: Store) -> tuple[dict, str]:
+    """Report engine capabilities: renderer availability, check count, runtime deps.
+
+    Documents the standing rule: no AI / Muse API is used at runtime — the
+    engine is deterministic checks plus its own headless Chromium.
+    """
+    from aafc_engine.auditor import render as render_provider
+    render_ok = render_provider.render_available()
+    names = audit_registry.list_checks()
+    caps = {
+        "render_available": render_ok,
+        "renderer": "playwright+chromium (local headless)" if render_ok else "none — HTTP-only mode",
+        "checks_registered": len(names),
+        "ai_runtime": False,
+        "runtime_note": "Deterministic checks + own headless Chromium only. No AI/Muse API at runtime.",
+    }
+    return {"capabilities": caps}, (
+        "Engine capabilities:\n"
+        f"  - Renderer: {caps['renderer']}\n"
+        f"  - Checks registered: {caps['checks_registered']}\n"
+        f"  - AI at runtime: no ({caps['runtime_note']})"
     )
 
 
@@ -784,6 +810,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--client", required=True)
     p.add_argument("--website", required=True)
     p.add_argument("--pages", type=int, default=6)
+    p.add_argument("--render", dest="render", action="store_true", default=True,
+                   help="verify DOM findings with the local headless Chromium (default when available)")
+    p.add_argument("--no-render", dest="render", action="store_false",
+                   help="force HTTP-only mode (no headless Chromium)")
     p.set_defaults(func=cmd_audit_run)
     p = audit_sub.add_parser("list", help="list audits")
     p.add_argument("--client", required=True)
@@ -799,6 +829,8 @@ def build_parser() -> argparse.ArgumentParser:
     checks_sub = checks_p.add_subparsers(dest="checks_cmd", required=True)
     p = checks_sub.add_parser("list", help="list registered checks")
     p.set_defaults(func=cmd_checks_list)
+    p = checks_sub.add_parser("capabilities", help="report engine capabilities (renderer, runtime)")
+    p.set_defaults(func=cmd_checks_capabilities)
 
     # report
     report_p = sub.add_parser("report", help="audit reports")

@@ -1,0 +1,15 @@
+# AAFC Engine — LOCAL development extras, PINNED.
+#
+# Install after requirements.txt for the full local experience:
+#   pip install -r requirements.txt -r requirements-local.txt
+#   playwright install chromium   # one-time browser download for the renderer
+#
+# These NEVER go into requirements.txt (the Vercel deploy set):
+#   - playwright: the hosted Quick Audit is HTTP-only by design; shipping a
+#     browser in the serverless bundle would bloat it past usefulness.
+#   - pytest: test runner, not a runtime dependency.
+#
+# Same update rule as requirements.txt: pinned, always.
+
+playwright==1.63.0
+pytest==9.1.1
